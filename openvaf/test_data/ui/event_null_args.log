@@ -1,0 +1,50 @@
+warning[L018]: 'cross' does not schedule an event yet
+   --> /event_null_args.va:20:9
+   |
+20 |         @(cross(V(smpl) - thresh, dir, , , en)) state = V(in);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
+   |
+   = the event expression is checked but takes no part in scheduling
+   = the guarded statement runs on every evaluation, not per event
+   = unscheduled_event is set to warn by default
+
+warning[L018]: 'cross' does not schedule an event yet
+   --> /event_null_args.va:22:9
+   |
+22 |         @(cross(V(smpl) - thresh, , , )) state = V(in);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
+   |
+   = the event expression is checked but takes no part in scheduling
+   = the guarded statement runs on every evaluation, not per event
+   = unscheduled_event is set to warn by default
+
+warning[L018]: 'above' does not schedule an event yet
+   --> /event_null_args.va:24:9
+   |
+24 |         @(above(V(smpl) - thresh, , , en)) state = V(in);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
+   |
+   = the event expression is checked but takes no part in scheduling
+   = the guarded statement runs on every evaluation, not per event
+   = unscheduled_event is set to warn by default
+
+warning[L018]: 'timer' does not schedule an event yet
+   --> /event_null_args.va:26:9
+   |
+26 |         @(timer(0.0, , , en)) state = V(in);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
+   |
+   = the event expression is checked but takes no part in scheduling
+   = the guarded statement runs on every evaluation, not per event
+   = unscheduled_event is set to warn by default
+
+warning[L018]: 'absdelta' does not schedule an event yet
+   --> /event_null_args.va:28:9
+   |
+28 |         @(absdelta(V(in), 0.1, , , en)) state = V(in);
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
+   |
+   = the event expression is checked but takes no part in scheduling
+   = the guarded statement runs on every evaluation, not per event
+   = unscheduled_event is set to warn by default
+

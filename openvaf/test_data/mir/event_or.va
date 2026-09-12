@@ -2,7 +2,10 @@
 // expressions together, so the body runs when any of them occurs. Named events
 // are the only kind that carries a runtime condition today, so `@(a or b)` lowers
 // to a single guard that is true when either was triggered.
-module event_or;
+// `@(timer(...))` is the only way to trigger a named event, and timer events are
+// not scheduled yet, so allow the warning: this test is about the OR operator, not
+// about the timer.
+(*openvaf_allow="unscheduled_event"*) module event_or;
     parameter real thresh = 0.5;
 
     event sampled;
