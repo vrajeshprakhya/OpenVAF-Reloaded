@@ -20,17 +20,25 @@ impl BodyLoweringCtx<'_, '_, '_> {
         self.lower_select_with(a, |_| TRUE, |_| b)
     }
 
-    /// VAMS-2023 5.10.3.1: whether `cross(expr, dir, ...)` fires in this evaluation.
+    /// VAMS-2023 5.10.3.1/5.10.3.2: whether `cross` or `above` fires in this
+    /// evaluation.
     ///
     /// The crossing is detected between the previous *accepted* timestep and this
     /// one: the expression's value is kept in a retained state (the same mechanism
     /// that gives `@(cross)` variables their cross-timestep memory), and the event
     /// fires when the two straddle zero in the requested direction.
     ///
-    /// This does not yet control the timestep, so the event lands on the first
-    /// accepted point *after* the crossing rather than inside the `time_tol` /
-    /// `expr_tol` box the LRM asks for — see the tracking issue. Ordering is right,
-    /// accuracy is bounded by the step the simulator happened to take.
+    /// `above` differs from `cross` in two ways the LRM is explicit about: it takes
+    /// no `dir` argument and triggers only from below, and it also fires during
+    /// initialization and dc -- "if the expression is positive at the conclusion of
+    /// the initial condition analysis that precedes a transient analysis, the
+    /// above() function shall generate an event", where `cross` stays quiet until
+    /// time has advanced from zero.
+    ///
+    /// Neither yet controls the timestep, so the event lands on the first accepted
+    /// point *after* the crossing rather than inside the `time_tol` / `expr_tol` box
+    /// the LRM asks for -- see the tracking issue. Ordering is right, accuracy is
+    /// bounded by the step the simulator happened to take.
     ///
     /// Returns `None` for an event function that is still unscheduled, which leaves
     /// its body unconditional as before.
@@ -39,11 +47,15 @@ impl BodyLoweringCtx<'_, '_, '_> {
             Expr::Call { fun: ResolvedFun::BuiltIn(fun), args } => (fun, args),
             _ => return None,
         };
-        // `above`, `timer` and `absdelta` need their own detection (initialization
-        // behaviour, breakpoints, delta tracking); they stay unscheduled for now.
-        if fun != BuiltIn::cross {
-            return None;
-        }
+        // Argument layout per function: `cross(expr, dir, time_tol, expr_tol,
+        // enable)` against `above(expr, time_tol, expr_tol, enable)` -- `above` has
+        // no direction, so `enable` sits one place earlier. `timer` and `absdelta`
+        // need breakpoints and delta tracking of their own; they stay unscheduled.
+        let (dir_arg, enable_arg) = match fun {
+            BuiltIn::cross => (Some(1), 4),
+            BuiltIn::above => (None, 3),
+            _ => return None,
+        };
 
         let expr = *args.first()?;
         if self.body.is_missing(expr) {
@@ -58,34 +70,72 @@ impl BodyLoweringCtx<'_, '_, '_> {
         self.ctx.store_retained(state, cur);
 
         let cur_ge = self.ctx.ins().fge(cur, F_ZERO);
-        let cur_le = self.ctx.ins().fle(cur, F_ZERO);
         let prev_lt = self.ctx.ins().flt(prev, F_ZERO);
-        let prev_gt = self.ctx.ins().fgt(prev, F_ZERO);
         let rising = self.and(prev_lt, cur_ge);
-        let falling = self.and(prev_gt, cur_le);
 
-        // `dir` is optional and defaults to "either direction". A value other than
-        // -1, 0 or +1 generates no event at all, which falls out of the comparisons.
-        let fired = match args.get(1) {
-            Some(&dir) if !self.body.is_missing(dir) => {
-                let dir = self.lower_expr(dir);
-                let zero = self.ctx.iconst(0);
-                let one = self.ctx.iconst(1);
-                let minus_one = self.ctx.iconst(-1);
-                let both = self.ctx.ins().ieq(dir, zero);
-                let up = self.ctx.ins().ieq(dir, one);
-                let down = self.ctx.ins().ieq(dir, minus_one);
-                let want_rising = self.or(up, both);
-                let want_falling = self.or(down, both);
-                let up = self.and(want_rising, rising);
-                let down = self.and(want_falling, falling);
-                self.or(up, down)
+        let fired = match dir_arg {
+            // `dir` is optional and defaults to "either direction". A value other
+            // than -1, 0 or +1 generates no event at all, which falls out of the
+            // comparisons.
+            Some(dir_arg) => {
+                let cur_le = self.ctx.ins().fle(cur, F_ZERO);
+                let prev_gt = self.ctx.ins().fgt(prev, F_ZERO);
+                let falling = self.and(prev_gt, cur_le);
+                match args.get(dir_arg) {
+                    Some(&dir) if !self.body.is_missing(dir) => {
+                        let dir = self.lower_expr(dir);
+                        let zero = self.ctx.iconst(0);
+                        let one = self.ctx.iconst(1);
+                        let minus_one = self.ctx.iconst(-1);
+                        let both = self.ctx.ins().ieq(dir, zero);
+                        let up = self.ctx.ins().ieq(dir, one);
+                        let down = self.ctx.ins().ieq(dir, minus_one);
+                        let want_rising = self.or(up, both);
+                        let want_falling = self.or(down, both);
+                        let up = self.and(want_rising, rising);
+                        let down = self.and(want_falling, falling);
+                        self.or(up, down)
+                    }
+                    _ => self.or(rising, falling),
+                }
             }
-            _ => self.or(rising, falling),
+            // `above` "generates a monitored analog event ... when the expression
+            // crosses zero (0) from below" and takes no direction argument.
+            None => rising,
         };
 
-        // "If enable is specified and it is zero, then cross() is inactive."
-        let fired = match args.get(4) {
+        let time = self.ctx.use_param(ParamKind::Abstime);
+        let advanced = self.ctx.ins().fgt(time, F_ZERO);
+
+        // `above` also fires wherever the expression is *already* positive before
+        // time has moved, which is 5.10.3.2's whole point: "if the expression is
+        // positive at the conclusion of the initial condition analysis that precedes
+        // a transient analysis, the above() function shall generate an event".
+        //
+        // The test is on `$abstime`, not on the analysis flags, because those are not
+        // stable across the Newton iterations of one timestep -- ngspice reports
+        // ANALYSIS_STATIC only on the first iteration of the initial step and
+        // ANALYSIS_TRAN on the rest, so a flag-gated event fires on one iteration and
+        // is then overwritten by the others. `$abstime` is fixed for the whole step.
+        //
+        // In a dc sweep this fires at every point where the expression is positive
+        // rather than only where it crosses, since nothing commits retained state
+        // while time stands still. 5.10.3.2 asks for crossings there and does not
+        // control the sweep step to resolve them; over-firing samples the same value
+        // a crossing would.
+        let fired = match fun {
+            BuiltIn::above => {
+                let not_advanced = self.ctx.ins().fle(time, F_ZERO);
+                let positive = self.ctx.ins().fgt(cur, F_ZERO);
+                let at_init = self.and(not_advanced, positive);
+                self.or(fired, at_init)
+            }
+            _ => fired,
+        };
+
+        // "If enable is specified and it is zero, then cross()/above() is inactive",
+        // which covers the initialization event too.
+        let fired = match args.get(enable_arg) {
             Some(&en) if !self.body.is_missing(en) => {
                 let en = self.lower_expr(en);
                 let zero = self.ctx.iconst(0);
@@ -95,12 +145,14 @@ impl BodyLoweringCtx<'_, '_, '_> {
             _ => fired,
         };
 
-        // "The cross() function can only generate an event after the simulation time
-        // has advanced from zero", and it generates none for dc, ac or noise. Both
-        // follow from requiring a positive time.
-        let time = self.ctx.use_param(ParamKind::Abstime);
-        let advanced = self.ctx.ins().fgt(time, F_ZERO);
-        Some(self.and(fired, advanced))
+        match fun {
+            // "The cross() function can only generate an event after the simulation
+            // time has advanced from zero", and it generates none for dc, ac or
+            // noise. Both follow from requiring a positive time.
+            BuiltIn::cross => Some(self.and(fired, advanced)),
+            BuiltIn::above => Some(fired),
+            _ => unreachable!("only cross and above take part in scheduling"),
+        }
     }
     pub(super) fn lower_stmt(&mut self, stmnt: StmtId) {
         // TODO(msrv): let .. else

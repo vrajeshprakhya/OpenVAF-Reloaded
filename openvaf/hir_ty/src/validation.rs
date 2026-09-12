@@ -1,6 +1,7 @@
 use basedb::diagnostics::{Diagnostic, Label, LabelStyle, Report};
 use basedb::lints::builtin::{
-    const_simparam, trivial_probe, unscheduled_event, variant_const_simparam,
+    const_simparam, ignored_discontinuity, trivial_probe, unscheduled_event,
+    variant_const_simparam,
 };
 use basedb::lints::{self, Lint, LintSrc};
 use basedb::{AstIdMap, BaseDB, FileId};
@@ -136,6 +137,10 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                 let src = self.body_sm.lint_src(stmt, unscheduled_event);
                 Some((unscheduled_event, src))
             }
+            BodyValidationDiagnostic::IgnoredDiscontinuity { stmt, .. } => {
+                let src = self.body_sm.lint_src(stmt, ignored_discontinuity);
+                Some((ignored_discontinuity, src))
+            }
             _ => None,
         }
     }
@@ -270,6 +275,26 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                         "the event expression is checked but takes no part in scheduling"
                             .to_owned(),
                         "the guarded statement runs on every evaluation, not per event".to_owned(),
+                    ])
+            }
+            BodyValidationDiagnostic::IgnoredDiscontinuity { expr, .. } => {
+                let FileSpan { range, file } = self.expr_src(expr);
+
+                Report::warning()
+                    .with_message("'$discontinuity' is ignored".to_owned())
+                    .with_labels(vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: file,
+                        range: range.into(),
+                        message: "the discontinuity is not announced".to_owned(),
+                    }])
+                    .with_notes(vec![
+                        "OSDI cannot announce a discontinuity, so the integrator keeps its history and step order"
+                            .to_owned(),
+                        "help: '$bound_step' does reach the simulator and can cap the step across the jump"
+                            .to_owned(),
+                        "note: '$discontinuity(-1)' is supported; it pairs with '$limit' (VAMS-2023 9.17.3)"
+                            .to_owned(),
                     ])
             }
             BodyValidationDiagnostic::WriteToInputArg { expr, arg } => {

@@ -688,6 +688,68 @@ fn test_slew() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 5.10.3.2: `above` also fires during initialization and dc when the
+/// expression is already positive, which is the whole reason it exists -- the LRM's
+/// own wording is that `cross` "would never trigger, even if the voltage on the smpl
+/// port is always above 2.5V". Afterwards it behaves like a rising-only `cross`.
+///
+/// See `above_detect.va`; the residual on the branch flow unknown is the held value.
+fn test_above_detect() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("above_detect.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // The initialization event is keyed on `$abstime` still being zero, not on the
+    // analysis flags: ngspice reports ANALYSIS_STATIC only on the first Newton
+    // iteration of the initial step, so a flag-gated event fires on one iteration
+    // and is overwritten by the others. The flags are left empty here so the test
+    // cannot pass by being handed a flag a real simulator would not hold steady.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    v_smpl: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+            sim.advance_time(1e-6);
+        }
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("smpl", v_smpl);
+        sim.set_voltage("out", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        sim.read_residual("flow(out)").0
+    };
+
+    // The initial solve at t = 0, with the clock already high: `above` samples here.
+    // This is the case `cross` cannot cover -- there is nothing to cross from.
+    let held = step(&instance, &model, &mut sim, 1.5, 5.0, true);
+    float_cmp::assert_approx_eq!(f64, held, 1.5, epsilon = 1e-9);
+
+    // Time has moved now, clock still high and never crossing: no new event, so the
+    // value sampled at initialization is held even though the input moved.
+    let held = step(&instance, &model, &mut sim, 2.5, 5.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 1.5, epsilon = 1e-9);
+
+    // Clock drops. `above` has no `dir` argument and triggers only from below, so a
+    // falling edge is not an event.
+    let held = step(&instance, &model, &mut sim, 3.5, 0.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 1.5, epsilon = 1e-9);
+
+    // Clock rises through the threshold: that is an event, like `cross`.
+    let held = step(&instance, &model, &mut sim, 4.5, 5.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 4.5, epsilon = 1e-9);
+
+    Ok(())
+}
+
 /// VAMS-2023 5.10.3.1: `cross` fires once per upward threshold crossing, so the
 /// sampled value is held between crossings instead of following the input.
 ///
@@ -757,5 +819,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect)]
 }

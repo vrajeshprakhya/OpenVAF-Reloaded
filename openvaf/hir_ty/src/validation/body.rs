@@ -7,7 +7,7 @@ use hir_def::{
     Literal, Lookup, ModuleBodyKind, NatureId, NodeId, ParamId, Path, Stmt, StmtId, VarId,
 };
 use stdx::impl_display;
-use syntax::ast::AssignOp;
+use syntax::ast::{AssignOp, UnaryOp};
 use syntax::name::{AsIdent, Name};
 
 use crate::builtin::{
@@ -69,6 +69,14 @@ pub enum BodyValidationDiagnostic {
     UnscheduledEvent {
         stmt: StmtId,
         func: BuiltIn,
+    },
+
+    /// VAMS-2023 9.17.1: `$discontinuity(n)` for a non-negative degree is accepted
+    /// but announces nothing, because OSDI has no channel for it. Only the
+    /// `$discontinuity(-1)` form that pairs with `$limit` (9.17.3) does anything.
+    IgnoredDiscontinuity {
+        stmt: StmtId,
+        expr: ExprId,
     },
 
     WriteToInputArg {
@@ -728,6 +736,21 @@ impl ExprValidator<'_, '_> {
         self.parent.body.exprs[expr].walk_child_exprs(|child| self.validate_expr(child))
     }
 
+    /// An integer literal, or a negated one. Mirrors `hir::Body::as_literalsignedint`,
+    /// which is not reachable from validation.
+    fn as_signed_int(&self, expr: ExprId) -> Option<i32> {
+        match &self.parent.body.exprs[expr] {
+            Expr::Literal(Literal::Int(val)) => Some(*val),
+            Expr::UnaryOp { expr, op: UnaryOp::Neg } => {
+                match &self.parent.body.exprs[*expr] {
+                    Expr::Literal(Literal::Int(val)) => Some(-val),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn validate_builtin(
         &mut self,
         name: &Option<Path>,
@@ -741,6 +764,18 @@ impl ExprValidator<'_, '_> {
                 .parent
                 .diagnostics
                 .push(BodyValidationDiagnostic::UnsupportedFunction { expr, func: call }),
+            BuiltIn::discontinuity => {
+                // The `$discontinuity(-1)` form is part of `$limit` (9.17.3) and is
+                // lowered; every other degree is dropped, so say so rather than let
+                // a model claim a discontinuity that never reaches the integrator.
+                let is_limit_form =
+                    args.first().is_some_and(|&arg| self.as_signed_int(arg) == Some(-1));
+                if !is_limit_form {
+                    self.parent.diagnostics.push(
+                        BodyValidationDiagnostic::IgnoredDiscontinuity { stmt: self.stmt, expr },
+                    );
+                }
+            }
             BuiltIn::potential | BuiltIn::flow => self.check_access(
                 |_| IllegalCtxAccessKind::NatureAccess,
                 expr,

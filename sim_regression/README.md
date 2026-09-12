@@ -17,11 +17,19 @@ event actually fires are claims about waveforms, so they belong here.
 
 ```sh
 export PATH=$HOME/ngspice-install/bin:$PATH
+
 cd sim_regression/sample_hold
 ../../target/release/openvaf-r sample_hold.va -o sample_hold.osdi
 ngspice -b sample_hold.cir
 python3 ../analyze_sample_hold.py
+
+cd ../above_init
+../../target/release/openvaf-r above_init.va -o above_init.osdi
+ngspice -b above_init.cir
+python3 ../analyze_above_init.py
 ```
+
+Each analyzer exits non-zero on failure.
 
 ## sample_hold — passing
 
@@ -62,6 +70,30 @@ local-all, before any crossing detection:
 with crossing detection but retained state in the OSDI state array:
   v(out) == 0 throughout -> the crossing is never detected at all
 ```
+
+## above_init — passing
+
+`above_init.va` is VAMS-2023 §5.10.3.2's own sample-and-hold: 5.10.3.1's module
+with `above` in place of `cross`. The netlist drives the scenario the clause was
+written for — the clock sits at 5 V for the entire run and never crosses the
+2.5 V threshold in either direction, so `cross` has nothing to trigger on and
+would leave `out` at 0 forever. The LRM's words: `cross` "would never trigger,
+even if the voltage on the smpl port is always above 2.5V".
+
+```
+v(smpl)                 : 5.000 .. 5.000 V  (never crosses 2.5 V)
+v(in) over the run      : 1.056 .. 6.000 V
+v(out) after settling   : 1.0000 .. 1.0000 V
+PASS: above() sampled at initialization and held -- LRM behaviour
+```
+
+This one earns its place twice over. `above`'s initialization event was first
+written gated on the `static` analysis flag, which the mock simulator was happy
+with because the test handed it that flag — but ngspice sets ANALYSIS_STATIC only
+on the *first Newton iteration* of the initial step and ANALYSIS_TRAN on the
+rest, so the event fired on one iteration and was overwritten by the others, and
+`v(out)` stayed at 0 for the whole run. The flags are not stable within a
+timestep; `$abstime` is. Nothing but a real integrator would have caught that.
 
 ## Why retained state does not live in the OSDI state array
 
