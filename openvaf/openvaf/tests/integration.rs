@@ -298,16 +298,18 @@ fn test_cross_latch() -> Result<()> {
     let mut instance = model.new_instance();
     let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
 
-    // Advance one timestep: swap prev/next state, re-apply the node voltages
-    // (next_iter zeroes the solution), evaluate, and load the DAE residual.
-    let step = |instance: &OsdiInstance,
-                model: &OsdiModel,
-                sim: &mut MockSimulation,
-                vd: f64,
-                first: bool| {
+    // Advance one timestep: swap prev/next state, move time on (a monitored event
+    // only fires once the simulation has advanced from zero), re-apply the node
+    // voltages (next_iter zeroes the solution), evaluate, load the DAE residual.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    vd: f64,
+                    first: bool| {
         if !first {
             sim.next_iter();
         }
+        sim.advance_time(1e-6);
         sim.set_voltage("q", 0.0);
         sim.set_voltage("d", vd);
         instance.eval(model, sim, EvalFlags::ENABLE_LIM | EvalFlags::INIT_LIM);
@@ -315,10 +317,19 @@ fn test_cross_latch() -> Result<()> {
         sim.read_residual("q").0
     };
 
-    // d high -> latch sets state=1 (residual = -1).
+    // Now that `cross` takes part in scheduling, the stimulus has to actually
+    // cross: starting at d high would step from the initial state straight past the
+    // threshold with nothing to cross *from*. Settle low first, state still 0.
     float_cmp::assert_approx_eq!(
         f64,
-        step(&instance, &model, &mut sim, 1.0, true),
+        step(&instance, &model, &mut sim, 0.0, true),
+        0.0,
+        epsilon = 1e-9
+    );
+    // d crosses 0.7 upward -> latch sets state=1 (residual = -1).
+    float_cmp::assert_approx_eq!(
+        f64,
+        step(&instance, &model, &mut sim, 1.0, false),
         -1.0,
         epsilon = 1e-9
     );
@@ -418,14 +429,15 @@ fn test_cross_array() -> Result<()> {
     let mut instance = model.new_instance();
     let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
 
-    let step = |instance: &OsdiInstance,
-                model: &OsdiModel,
-                sim: &mut MockSimulation,
-                vd: f64,
-                first: bool| {
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    vd: f64,
+                    first: bool| {
         if !first {
             sim.next_iter();
         }
+        sim.advance_time(1e-6);
         sim.set_voltage("q0", 0.0);
         sim.set_voltage("q1", 0.0);
         sim.set_voltage("d", vd);
@@ -439,7 +451,9 @@ fn test_cross_array() -> Result<()> {
         float_cmp::assert_approx_eq!(f64, b, eb, epsilon = 1e-9);
     };
 
-    check(step(&instance, &model, &mut sim, 1.0, true), -1.0, -2.0); // set s=[1,2]
+    // settle low first: a monitored event needs something to cross *from*
+    check(step(&instance, &model, &mut sim, 0.0, true), 0.0, 0.0);
+    check(step(&instance, &model, &mut sim, 1.0, false), -1.0, -2.0); // set s=[1,2]
     check(step(&instance, &model, &mut sim, 0.5, false), -1.0, -2.0); // dead-band: retained
     check(step(&instance, &model, &mut sim, 0.0, false), 0.0, 0.0); // clear s=[0,0]
     check(step(&instance, &model, &mut sim, 0.5, false), 0.0, 0.0); // dead-band: retained
@@ -674,6 +688,66 @@ fn test_slew() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 5.10.3.1: `cross` fires once per upward threshold crossing, so the
+/// sampled value is held between crossings instead of following the input.
+///
+/// The detector compares the expression against its value at the previous
+/// *accepted* timestep, which is what `next_iter` models here. See
+/// `cross_detect.va`.
+fn test_cross_detect() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("cross_detect.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // One accepted timestep: commit the previous state, advance time, apply the
+    // inputs, evaluate. The residual on the branch flow unknown is the held value.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    v_smpl: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+        }
+        sim.advance_time(1e-6);
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("smpl", v_smpl);
+        sim.set_voltage("out", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        sim.read_residual("flow(out)").0
+    };
+
+    // Below the threshold: nothing sampled yet.
+    let held = step(&instance, &model, &mut sim, 1.0, 0.0, true);
+    float_cmp::assert_approx_eq!(f64, held, 0.0, epsilon = 1e-9);
+
+    // Cross upward: samples v(in) = 2.0.
+    let held = step(&instance, &model, &mut sim, 2.0, 5.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 2.0, epsilon = 1e-9);
+
+    // Still high, no new crossing: the input moved but the held value must not.
+    let held = step(&instance, &model, &mut sim, 3.0, 5.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 2.0, epsilon = 1e-9);
+
+    // Falling edge, and `dir` is +1, so this is not an event either.
+    let held = step(&instance, &model, &mut sim, 4.0, 0.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 2.0, epsilon = 1e-9);
+
+    // Cross upward again: samples the new input.
+    let held = step(&instance, &model, &mut sim, 5.0, 5.0, false);
+    float_cmp::assert_approx_eq!(f64, held, 5.0, epsilon = 1e-9);
+
+    Ok(())
+}
+
 harness! {
     // TODO: run this in CI, somehow this test is flakey tough regarding the linker invocation (and really slow)
     Test::from_dir("integration", &integration_test, &ignore_dev_tests, &project_root().join("integration_tests")),
@@ -683,5 +757,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect)]
 }

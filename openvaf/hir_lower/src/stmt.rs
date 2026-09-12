@@ -1,12 +1,107 @@
-use hir::{BranchWrite, Case, CaseCond, ContributeKind, Expr, ExprId, Node, Stmt, StmtId, Type};
+use hir::{
+    BranchWrite, BuiltIn, Case, CaseCond, ContributeKind, Expr, ExprId, Node, ResolvedFun, Stmt,
+    StmtId, Type,
+};
 use mir::builder::InstBuilder;
-use mir::{Opcode, Value, F_ZERO};
+use mir::{Opcode, Value, FALSE, F_ZERO, TRUE};
 use syntax::ast::BinaryOp;
 
 use crate::body::BodyLoweringCtx;
 use crate::{CallBackKind, CurrentKind, ImplicitEquationKind, ParamKind, PlaceKind};
 
 impl BodyLoweringCtx<'_, '_, '_> {
+    /// `a && b`, lowered the way `BinaryOp::BooleanAnd` is.
+    fn and(&mut self, a: Value, b: Value) -> Value {
+        self.lower_select_with(a, |_| b, |_| FALSE)
+    }
+
+    /// `a || b`, lowered the way `BinaryOp::BooleanOr` is.
+    fn or(&mut self, a: Value, b: Value) -> Value {
+        self.lower_select_with(a, |_| TRUE, |_| b)
+    }
+
+    /// VAMS-2023 5.10.3.1: whether `cross(expr, dir, ...)` fires in this evaluation.
+    ///
+    /// The crossing is detected between the previous *accepted* timestep and this
+    /// one: the expression's value is kept in a retained state (the same mechanism
+    /// that gives `@(cross)` variables their cross-timestep memory), and the event
+    /// fires when the two straddle zero in the requested direction.
+    ///
+    /// This does not yet control the timestep, so the event lands on the first
+    /// accepted point *after* the crossing rather than inside the `time_tol` /
+    /// `expr_tol` box the LRM asks for — see the tracking issue. Ordering is right,
+    /// accuracy is bounded by the step the simulator happened to take.
+    ///
+    /// Returns `None` for an event function that is still unscheduled, which leaves
+    /// its body unconditional as before.
+    fn lower_monitored_event(&mut self, call: ExprId) -> Option<Value> {
+        let (fun, args) = match self.body.get_expr(call) {
+            Expr::Call { fun: ResolvedFun::BuiltIn(fun), args } => (fun, args),
+            _ => return None,
+        };
+        // `above`, `timer` and `absdelta` need their own detection (initialization
+        // behaviour, breakpoints, delta tracking); they stay unscheduled for now.
+        if fun != BuiltIn::cross {
+            return None;
+        }
+
+        let expr = *args.first()?;
+        if self.body.is_missing(expr) {
+            return None;
+        }
+        let cur = self.lower_expr(expr);
+
+        // The previous accepted value of the expression. Stored unconditionally, so
+        // the comparison always refers to the last accepted timestep.
+        let state = self.ctx.alloc_retained_state();
+        let prev = self.ctx.retained_prev(state);
+        self.ctx.store_retained(state, cur);
+
+        let cur_ge = self.ctx.ins().fge(cur, F_ZERO);
+        let cur_le = self.ctx.ins().fle(cur, F_ZERO);
+        let prev_lt = self.ctx.ins().flt(prev, F_ZERO);
+        let prev_gt = self.ctx.ins().fgt(prev, F_ZERO);
+        let rising = self.and(prev_lt, cur_ge);
+        let falling = self.and(prev_gt, cur_le);
+
+        // `dir` is optional and defaults to "either direction". A value other than
+        // -1, 0 or +1 generates no event at all, which falls out of the comparisons.
+        let fired = match args.get(1) {
+            Some(&dir) if !self.body.is_missing(dir) => {
+                let dir = self.lower_expr(dir);
+                let zero = self.ctx.iconst(0);
+                let one = self.ctx.iconst(1);
+                let minus_one = self.ctx.iconst(-1);
+                let both = self.ctx.ins().ieq(dir, zero);
+                let up = self.ctx.ins().ieq(dir, one);
+                let down = self.ctx.ins().ieq(dir, minus_one);
+                let want_rising = self.or(up, both);
+                let want_falling = self.or(down, both);
+                let up = self.and(want_rising, rising);
+                let down = self.and(want_falling, falling);
+                self.or(up, down)
+            }
+            _ => self.or(rising, falling),
+        };
+
+        // "If enable is specified and it is zero, then cross() is inactive."
+        let fired = match args.get(4) {
+            Some(&en) if !self.body.is_missing(en) => {
+                let en = self.lower_expr(en);
+                let zero = self.ctx.iconst(0);
+                let enabled = self.ctx.ins().ine(en, zero);
+                self.and(fired, enabled)
+            }
+            _ => fired,
+        };
+
+        // "The cross() function can only generate an event after the simulation time
+        // has advanced from zero", and it generates none for dc, ac or noise. Both
+        // follow from requiring a positive time.
+        let time = self.ctx.use_param(ParamKind::Abstime);
+        let advanced = self.ctx.ins().fgt(time, F_ZERO);
+        Some(self.and(fired, advanced))
+    }
     pub(super) fn lower_stmt(&mut self, stmnt: StmtId) {
         // TODO(msrv): let .. else
         let stmnt = if let Some(stmnt) = self.body.get_stmt(stmnt) {
@@ -36,31 +131,43 @@ impl BodyLoweringCtx<'_, '_, '_> {
                         )
                     });
 
-                // A named event is the only kind that carries a runtime condition:
-                // an event function takes no part in scheduling yet, so its body is
-                // always evaluated. If every element is a named event the body runs
-                // when any of their flags is set; otherwise it runs unconditionally.
-                let named: Option<Vec<_>> = events
-                    .iter()
-                    .map(|event| match *event {
-                        // `None` for an unresolved event, which was already diagnosed
-                        hir::Event::Named { event } => self.body.resolve_event(event),
-                        _ => None,
-                    })
-                    .collect();
-
                 if initial_step {
                     let prev = self.ctx.in_initial_step;
                     self.ctx.in_initial_step = true;
                     self.lower_stmt(body);
                     self.ctx.in_initial_step = prev;
-                } else if let Some(named) = named.filter(|named| !named.is_empty()) {
-                    // `@(ev)` runs its body only if `ev` was triggered earlier in
-                    // this evaluation of the analog block (VAMS-2023 5.10.4).
-                    let mut cond = self.ctx.use_place(PlaceKind::NamedEvent(named[0]));
-                    for event in &named[1..] {
-                        let next = self.ctx.use_place(PlaceKind::NamedEvent(*event));
-                        cond = self.lower_select_with(cond, |_| mir::TRUE, |_| next);
+                    return;
+                }
+
+                // Every element that carries a runtime condition contributes one:
+                // a named event its flag (VAMS-2023 5.10.4), a monitored event its
+                // crossing detection (5.10.3). The body is guarded by the
+                // disjunction only if *every* element has one -- an element that is
+                // still unscheduled, or an unresolved event, leaves the body
+                // unconditional, which is how all of them behaved before.
+                let mut conds = Vec::with_capacity(events.len());
+                let mut all = !events.is_empty();
+                for event in events {
+                    let cond = match *event {
+                        hir::Event::Named { event } => self
+                            .body
+                            .resolve_event(event)
+                            .map(|event| self.ctx.use_place(PlaceKind::NamedEvent(event))),
+                        hir::Event::Cross { call: Some(call) } => self.lower_monitored_event(call),
+                        _ => None,
+                    };
+                    match cond {
+                        Some(cond) => conds.push(cond),
+                        // keep going: a monitored element still has to track its
+                        // expression even when a sibling leaves the body unguarded
+                        None => all = false,
+                    }
+                }
+
+                if all {
+                    let mut cond = conds[0];
+                    for next in &conds[1..] {
+                        cond = self.or(cond, *next);
                     }
                     self.ctx.make_cond(cond, |ctx, branch| {
                         if branch {
