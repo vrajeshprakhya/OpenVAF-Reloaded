@@ -27,7 +27,7 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
         retained.retain(|v| seen.insert(*v));
 
         // (place, state, element type) for every retained slot, in store order.
-        let mut slots: Vec<(PlaceKind, crate::LimitState, Type)> = Vec::new();
+        let mut slots: Vec<(PlaceKind, crate::RetainedState, Type)> = Vec::new();
 
         if !self.ctx.no_equations {
             for &var in &retained {
@@ -69,7 +69,7 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
 
     /// Read a retained slot's previous-timestep value (stored as real) back into the
     /// variable's element type. A real element needs no cast.
-    fn retained_load(&mut self, state: crate::LimitState, elem_ty: &Type) -> Value {
+    fn retained_load(&mut self, state: crate::RetainedState, elem_ty: &Type) -> Value {
         let prev = self.ctx.retained_prev(state);
         match elem_ty {
             Type::Real => prev,
@@ -78,7 +78,7 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
     }
 
     /// Store a retained slot's final value (cast to real) for the next timestep.
-    fn retained_save(&mut self, state: crate::LimitState, val: Value, elem_ty: &Type) {
+    fn retained_save(&mut self, state: crate::RetainedState, val: Value, elem_ty: &Type) {
         let as_real = match elem_ty {
             Type::Real => val,
             _ => self.ctx.insert_cast(val, elem_ty, &Type::Real),

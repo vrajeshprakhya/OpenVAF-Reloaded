@@ -304,6 +304,23 @@ impl BodyValidator<'_> {
                         _ => None,
                     })
                     .collect();
+                // Mirror `hir_lower`'s `EventControl`: the body is guarded only if
+                // *every* element of the event expression carries a runtime
+                // condition -- a named event its flag, `cross` its crossing. One
+                // element without one (a global event, `timer`, ...) leaves the whole
+                // body unconditional, however well the others schedule.
+                let all_scheduled = !events.is_empty()
+                    && events.iter().all(|event| match *event {
+                        Event::Named { event } => {
+                            matches!(self.infer.expr_types[event], Ty::Event(_))
+                        }
+                        Event::Cross { call: Some(call) } => matches!(
+                            self.infer.resolved_calls.get(&call),
+                            Some(ResolvedFun::BuiltIn(func)) if func.schedules_event()
+                        ),
+                        _ => false,
+                    });
+
                 let old = replace(&mut self.ctx, BodyCtx::EventControl);
                 let old_event = replace(&mut self.in_event_control, true);
                 // The event expression is validated in the event context too: it may
@@ -313,12 +330,16 @@ impl BodyValidator<'_> {
                     self.validate_expr(call, stmt);
                     self.event_call = old_call;
 
-                    // The event condition does not take part in scheduling yet (see
-                    // `hir_lower`'s `EventControl`): the guarded statement runs on
-                    // every evaluation. Warn instead of silently accepting a model
-                    // whose behaviour is not the one it describes.
+                    // `cross` decides whether the body runs (VAMS-2023 5.10.3.1),
+                    // so on its own it no longer warns; `above`, `timer` and
+                    // `absdelta` still take no part in scheduling. Either way the
+                    // warning stands if some other element of the same event
+                    // expression leaves the body unconditional, because then this
+                    // function does not end up scheduling anything either. Warn
+                    // instead of silently accepting a model whose behaviour is not
+                    // the one it describes.
                     if let Some(ResolvedFun::BuiltIn(func)) = self.infer.resolved_calls.get(&call) {
-                        if func.is_event_fun() {
+                        if func.is_event_fun() && !(func.schedules_event() && all_scheduled) {
                             self.diagnostics.push(BodyValidationDiagnostic::UnscheduledEvent {
                                 stmt,
                                 func: *func,

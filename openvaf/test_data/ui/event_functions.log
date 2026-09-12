@@ -1,53 +1,3 @@
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:32:9
-   |
-32 |         @(cross(V(d) - 0.5)) y = 1.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:33:9
-   |
-33 |         @(cross(V(d) - 0.5, +1)) y = 2.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:34:9
-   |
-34 |         @(cross(V(d) - 0.5, -1, ttol)) y = 3.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:35:9
-   |
-35 |         @(cross(V(d) - 0.5, dir, ttol, etol)) y = 4.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:36:9
-   |
-36 |         @(cross(V(d) - 0.5, dir, ttol, etol, enable)) y = 5.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
 warning[L018]: 'above' does not schedule an event yet
    --> /event_functions.va:39:9
    |
@@ -163,16 +113,6 @@ warning[L018]: 'absdelta' does not schedule an event yet
    |
 54 |         @(absdelta(V(d), delta, ttol, etol, enable)) y = 17.0;
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'cross' does not schedule an event yet
-   --> /event_functions.va:57:9
-   |
-57 |         @(cross(V(d), 0, 1, 1)) y = 18.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
    |
    = the event expression is checked but takes no part in scheduling
    = the guarded statement runs on every evaluation, not per event

@@ -78,6 +78,11 @@ const ANALOG_OPERATORS_SYSFUN: [&str; 1] = ["$limit"];
 // may only appear as the event expression of an event control (`@(...)`).
 const EVENT_FUNS: [&str; 4] = ["cross", "above", "timer", "absdelta"];
 
+// The subset of EVENT_FUNS that actually takes part in scheduling, i.e. decides
+// whether the body of its event control runs. The rest are accepted and
+// type-checked but leave the body unconditional; `unscheduled_event` warns.
+const SCHEDULING_EVENT_FUNS: [&str; 1] = ["cross"];
+
 const ANALYSIS_FUNS: [&str; 6] =
     ["analysis", "ac_stim", "noise_table", "noise_table_log", "white_noise", "flicker_noise"];
 
@@ -241,6 +246,8 @@ fn generate_builtins() {
     let analysis_funs = ANALYSIS_FUNS.into_iter().map(|op| format_ident!("{}", op));
     let analog_operators = ANALOG_OPERATORS.into_iter().map(|op| format_ident!("{}", op));
     let event_funs = EVENT_FUNS.into_iter().map(|op| format_ident!("{}", op));
+    let scheduling_event_funs =
+        SCHEDULING_EVENT_FUNS.into_iter().map(|op| format_ident!("{}", op));
     let unsupported = UNSUPPORTED.into_iter().map(|op| format_ident!("{}", op));
     let analog_operators_sysfun =
         ANALOG_OPERATORS_SYSFUN.into_iter().map(|op| format_ident!("{}", &op[1..]));
@@ -300,6 +307,18 @@ fn generate_builtins() {
             pub fn is_event_fun(self)->bool{
                 match self{
                     #(BuiltIn::#event_funs)|* =>true,
+                    _ => false
+                }
+            }
+
+            /// Whether this event function takes part in scheduling, i.e. decides
+            /// whether the body of its event control runs. The other event
+            /// functions are accepted and type-checked but leave the body
+            /// unconditional, which `unscheduled_event` warns about.
+            #[allow(clippy::match_like_matches_macro)]
+            pub fn schedules_event(self)->bool{
+                match self{
+                    #(BuiltIn::#scheduling_event_funs)|* =>true,
                     _ => false
                 }
             }

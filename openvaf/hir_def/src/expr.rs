@@ -200,9 +200,9 @@ pub enum Event {
     ///
     /// `call` is the event-function call expression (VAMS-2023 5.10.3), collected so
     /// that its arguments are name-resolved and type-checked. It is `None` when the
-    /// event expression was missing or was not a call. The call itself is never
-    /// lowered: the event condition does not take part in scheduling, the guarded
-    /// body is always evaluated (see `hir_lower`'s `EventControl`).
+    /// event expression was missing or was not a call. `cross` is lowered into a
+    /// condition that guards the body; the other event functions are not, and leave
+    /// the body unconditional (see `hir_lower`'s `EventControl`).
     Cross {
         call: Option<ExprId>,
     },

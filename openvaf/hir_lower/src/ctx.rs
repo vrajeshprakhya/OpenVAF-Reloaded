@@ -9,7 +9,7 @@ use typed_indexmap::TiSet;
 
 use crate::{
     CallBackKind, HirInterner, ImplicitEquation, ImplicitEquationKind, LimitState, ParamKind,
-    PlaceKind,
+    PlaceKind, RetainedState,
 };
 
 pub struct LoweringCtx<'a, 'c> {
@@ -25,12 +25,11 @@ pub struct LoweringCtx<'a, 'c> {
     /// but necessary to avoid accidental correlation/opimization.
     /// For example white_noise(x) - white_noise(x) is not zero.
     pub num_noise_sources: u32,
-    /// Variables assigned inside `@(cross)` handlers, each mapped to the limit-state
-    /// slot that stores its value across timesteps (latch / event retention).
     /// Variables assigned inside `@(cross)` handlers that must retain their value
-    /// across timesteps. Each is backed by one retained limit-state slot per scalar,
-    /// or one per element for an array variable (in element order).
-    pub retained_states: AHashMap<Variable, Vec<LimitState>>,
+    /// across timesteps (latch / event retention). Each is backed by one retained
+    /// slot for a scalar, or one per element for an array variable (in element
+    /// order).
+    pub retained_states: AHashMap<Variable, Vec<RetainedState>>,
     /// True while lowering an `@(initial_step)` body: resets of retained variables
     /// there are their initial value (read from the retained state), not a
     /// per-evaluation reset.
@@ -51,10 +50,6 @@ pub struct LoopTargets {
     /// Where `break` jumps.
     pub break_to: Block,
 }
-
-/// Synthetic constant base used as the (non-parameter) `lim_state` key for retained
-/// `@(cross)` slots, chosen to not collide with ordinary integer literals.
-const RETAINED_STATE_KEY_BASE: i32 = 0x5E7A_0000;
 
 impl<'a, 'c> LoweringCtx<'a, 'c> {
     pub fn new(
@@ -259,28 +254,23 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
         val
     }
 
-    /// Allocate a limit-state slot used purely to retain a value across timesteps
-    /// (the latch state of an `@(cross)` variable). It reuses the limit state-array
-    /// machinery (`prev_state`/`next_state`) but is keyed on a synthetic constant and
-    /// marked retained, so the limit-specific passes skip it.
-    pub fn alloc_retained_state(&mut self) -> LimitState {
-        let idx = self.intern.lim_state.len() as i32;
-        let key = self.iconst(RETAINED_STATE_KEY_BASE.wrapping_add(idx));
-        let dst = self.intern.lim_state.raw.entry(key);
-        let state = LimitState::from(dst.index());
-        dst.or_default().push((F_ZERO, false));
-        self.intern.retained_lim_states.insert(state);
+    /// Allocate a slot that retains a value from one accepted timestep to the next
+    /// (the latch state of an `@(cross)` variable, or a monitored expression's
+    /// previous value). The backend gives each slot a pair of instance-data fields.
+    pub fn alloc_retained_state(&mut self) -> RetainedState {
+        let state = RetainedState::from(self.intern.num_retained_states);
+        self.intern.num_retained_states += 1;
         state
     }
 
     /// Read the value retained from the previous accepted timestep.
-    pub fn retained_prev(&mut self, state: LimitState) -> Value {
-        self.use_param(ParamKind::PrevState(state))
+    pub fn retained_prev(&mut self, state: RetainedState) -> Value {
+        self.use_param(ParamKind::PrevRetained(state))
     }
 
     /// Store `val` as the retained value for the next timestep.
-    pub fn store_retained(&mut self, state: LimitState, val: Value) {
-        self.call1(CallBackKind::StoreLimit(state), &[val]);
+    pub fn store_retained(&mut self, state: RetainedState, val: Value) {
+        self.call1(CallBackKind::StoreRetained(state), &[val]);
     }
 
     pub fn implicit_equation(&mut self, kind: ImplicitEquationKind) -> (ImplicitEquation, Value) {

@@ -23,26 +23,82 @@ ngspice -b sample_hold.cir
 python3 ../analyze_sample_hold.py
 ```
 
-## sample_hold — currently FAILING, by design
+## sample_hold — passing
 
 `sample_hold.va` is VAMS-2023 §5.10.3.1's own sample-and-hold, written verbatim.
 Per the LRM `state` updates only when `V(smpl)` crosses the threshold upward, so
 `out` is a staircase holding each sampled value until the next crossing.
 
-Baseline measured on `local-all` (2026-09-11), which is the behaviour issue #37
-describes:
+The analyzer checks two independent claims and exits non-zero if either fails:
+
+| check | what it catches |
+| --- | --- |
+| hold | `out` must not move between sample edges |
+| accuracy | the held value must be `v(in)` at the interpolated crossing instant |
+
+Current result:
 
 ```
-max |v(out) - v(in)| over the run : 0.0050 V      <- out follows the input
-worst drift within a hold interval: 0.9430 V      <- should be ~0
-VERDICT: out TRACKS the input -- the event never fires, body runs every step
+worst drift within a hold interval : 7.49e-06 V  (tol 5e-03)
+worst held-vs-sampled error        : 7.50e-05 V  (tol 1e-03)
+PASS: out holds each sampled value between edges -- LRM behaviour
 ```
 
-The 5 mV is just the 10 ns `transition` lag on a 0.5 V/us ramp: the output is
-tracking, not holding.
+The 75 uV is not noise, it is the remaining half of issue #37: `cross` detects
+the crossing but does not yet *place* a timestep on it, so the event lands on the
+first accepted step after the crossing and the input has moved on by then (0.5
+V/us times one step). Closing that means driving `bound_step` from the pending
+crossing so the step lands inside the `time_tol` / `expr_tol` box, at which point
+this number should drop by orders of magnitude. It is the natural next
+acceptance criterion — tighten `SAMPLE_TOL` when it does.
 
-**This is the acceptance criterion for event scheduling.** When `cross()` takes
-part in scheduling, the same run must instead show a drift near zero within each
-hold interval, and `v(out)` sitting at the sampled values 0.554, 1.554, 2.554,
-3.554 and 4.554 V. Until then the test failing is the correct result, and the
-`unscheduled_event` lint warns about the same thing at compile time.
+For the record, the two earlier states of this test, both of which it now
+distinguishes by name:
+
+```
+local-all, before any crossing detection:
+  worst drift 0.9430 V   -> out TRACKS the input, the body runs every step
+
+with crossing detection but retained state in the OSDI state array:
+  v(out) == 0 throughout -> the crossing is never detected at all
+```
+
+## Why retained state does not live in the OSDI state array
+
+Worth writing down, because it is the reason the middle state above looked like a
+compiler bug and was not one.
+
+`@(cross)` needs the value its expression had at the previous *accepted* timestep.
+The obvious home is OSDI's `prev_state` / `next_state`, and that is where it
+started. It cannot work there:
+
+* `OSDIload` passes `ckt->CKTstates[0]` as **both** `prev_state` and `next_state`
+  (ngspice-46 `src/osdi/osdiload.c:141`), so the two alias.
+* `dctran` rotates that ring once per accepted step
+  (`src/spicelib/analysis/dctran.c:659`) over `MAX(2,maxord)+2` buffers
+  (`cktsetup.c:192`), so with the default `maxord = 2` a model reads back the
+  slot it wrote **four steps** ago.
+
+Neither is a conformance violation: the OSDI header documents no semantics for
+those pointers, and the array's real purpose is `$limit`, where aliasing gives
+exactly the previous-Newton-iteration value that limiting wants. It is also why
+nobody noticed — a limit state only steers the Newton path and never the
+converged answer. A retained value *is* the answer.
+
+So retained slots live in the instance data instead, which no simulator rotates,
+committed on `$abstime` movement. See the retained-state note at the top of
+`openvaf/osdi/stdlib.c` for the mechanism and its rejected-timestep handling.
+
+Two things are still worth fixing upstream, neither of them here:
+
+1. **ngspice**: even read as "previous iteration", the ring rotation is wrong.
+   The first Newton iteration of every step reads a four-step-old buffer rather
+   than the last accepted value, because nothing copies `CKTstates[1]` into
+   `[0]` for OSDI devices (classic SPICE devices rewrite all their state each
+   load, so they never needed it). That is a convergence-quality bug in `$limit`
+   that stands on its own.
+2. **OSDI**: there is no facility with accepted-timestep semantics, and one
+   pointer cannot serve both meanings. The precedent for how it should look is
+   `absdelay`, the other genuinely time-dependent operator: it is a
+   descriptor-level protocol (`OsdiAbsDelayInfo`) where the simulator owns the
+   history, not something a model fakes through the state array.

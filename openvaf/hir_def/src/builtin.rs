@@ -238,6 +238,17 @@ impl BuiltIn {
             _ => false,
         }
     }
+    #[doc = r" Whether this event function takes part in scheduling, i.e. decides"]
+    #[doc = r" whether the body of its event control runs. The other event"]
+    #[doc = r" functions are accepted and type-checked but leave the body"]
+    #[doc = r" unconditional, which `unscheduled_event` warns about."]
+    #[allow(clippy::match_like_matches_macro)]
+    pub fn schedules_event(self) -> bool {
+        match self {
+            BuiltIn::cross => true,
+            _ => false,
+        }
+    }
     #[allow(clippy::match_like_matches_macro)]
     pub fn is_analysis_var(self) -> bool {
         match self {
