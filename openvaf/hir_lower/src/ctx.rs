@@ -25,15 +25,13 @@ pub struct LoweringCtx<'a, 'c> {
     /// but necessary to avoid accidental correlation/opimization.
     /// For example white_noise(x) - white_noise(x) is not zero.
     pub num_noise_sources: u32,
-    /// Variables assigned inside `@(cross)` handlers that must retain their value
-    /// across timesteps (latch / event retention). Each is backed by one retained
-    /// slot for a scalar, or one per element for an array variable (in element
-    /// order).
+    /// Variables that must keep their value from one evaluation to the next, because
+    /// they can be read before they are written. Each is backed by one retained slot
+    /// for a scalar, or one per element for an array variable (in element order).
     pub retained_states: AHashMap<Variable, Vec<RetainedState>>,
-    /// True while lowering an `@(initial_step)` body: resets of retained variables
-    /// there are their initial value (read from the retained state), not a
-    /// per-evaluation reset.
-    pub in_initial_step: bool,
+    /// Retained flag marking that the first evaluation is behind us, allocated the
+    /// first time an `@(initial_step)` body needs it. See [`Self::first_eval`].
+    pub initial_step_flag: Option<RetainedState>,
     /// Stack of enclosing loops for `break`/`continue` (innermost last).
     pub loop_stack: Vec<LoopTargets>,
     /// Exit block of the analog function currently being lowered, if any.
@@ -68,7 +66,7 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
             intern,
             num_noise_sources: 0,
             retained_states: AHashMap::default(),
-            in_initial_step: false,
+            initial_step_flag: None,
             loop_stack: Vec::new(),
             function_exit: None,
             function_return: None,
@@ -262,6 +260,34 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
     /// 4.5.10).
     pub fn alloc_retained_state(&mut self, init: f64) -> RetainedState {
         self.intern.retained_init.push_and_get_key(init)
+    }
+
+    /// Whether this is still the first evaluation, for guarding an `@(initial_step)`
+    /// body (VAMS-2023 5.10.2: "active during the solution of the first point ... of
+    /// every analysis").
+    ///
+    /// A retained flag, not an analysis flag: the flags are not stable across the
+    /// Newton iterations of one step, and retained state commits only once time
+    /// moves, so the flag reads false for every iteration of the first point and
+    /// true from the next accepted step onwards -- which is exactly the window the
+    /// clause describes. In an analysis where time never moves at all, dc or ac, it
+    /// stays false and the body runs at every point.
+    pub fn first_eval(&mut self) -> Value {
+        let state = match self.initial_step_flag {
+            Some(state) => state,
+            None => {
+                let state = self.alloc_retained_state(0.0);
+                self.initial_step_flag = Some(state);
+                state
+            }
+        };
+        let seen = self.retained_prev(state);
+        // Written unconditionally, so it is set from the first evaluation onwards
+        // whether or not the guarded body ran.
+        let one = self.fconst(1.0);
+        self.store_retained(state, one);
+        let half = self.fconst(0.5);
+        self.ins().flt(seen, half)
     }
 
     /// Read the value retained from the previous accepted timestep.

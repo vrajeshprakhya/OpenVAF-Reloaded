@@ -13,11 +13,11 @@ Asserted:
             the timestep, so this is purely what linear interpolation gives across
             the step the integrator took.
 
-Also printed, but NOT asserted: `period`, the LRM's own use of the function from
-the same clause. It needs `latest` to still hold what it held at the end of the
-previous evaluation, and it does not -- see the analog-variable persistence gap in
-docs/lrm-system-level-gaps.md. The number is here so it stops being 0 the moment
-that is fixed.
+  period    4.5.10's own use of the function, from the same clause: the distance
+            between consecutive rising crossings. It reads `latest` inside the
+            `@(cross)` handler *before* the statement that assigns it, so it only
+            comes out right if analog variables keep their value between
+            evaluations. That is the second thing this test pins down.
 
 Exits non-zero on failure.
 """
@@ -26,6 +26,7 @@ import sys
 
 FREQ = 200e3
 EXPECTED = [5e-6, 10e-6, 15e-6, 20e-6]
+PERIOD = 5e-6
 TIME_TOL = 1e-11   # 10 ps; the measured error is ~0.2 ps
 
 rows = []
@@ -71,15 +72,22 @@ for k, want in enumerate(EXPECTED):
 print()
 print(f"worst crossing-time error : {worst:.2e} s  (tol {TIME_TOL:.0e})")
 
-# Diagnostic only -- see the module comment.
+# The period, measurable only from the second crossing on -- which is why 4.5.10's
+# example guards it with `if (crossings < 2)`.
 late = [r for r in rows if r[0] > 12e-6]
-if late:
-    per = late[-1][2]
-    verdict = "as expected while persistence is unimplemented" if abs(per) < 1e-12 or abs(per - late[-1][1]) < 1e-12 else "CHANGED"
-    print(f"period reading (not asserted) : {per*1e6:.6f}us, want 5.000000us -- {verdict}")
+if not late:
+    sys.exit("no samples after the second crossing")
+per_err = max(abs(r[2] - PERIOD) for r in late)
+print(f"period after 2 crossings  : {late[-1][2]*1e6:.6f}us, want {PERIOD*1e6:.6f}us"
+      f"   err {per_err:.2e} s")
 
 print()
 if worst > TIME_TOL:
     sys.exit(f"FAIL: crossing time off by {worst:.2e} s")
+if per_err > TIME_TOL:
+    sys.exit(
+        f"FAIL: period off by {per_err:.2e} s -- `latest` is not keeping its value "
+        "between evaluations, so the handler reads it before it is assigned"
+    )
 
-print("PASS: last_crossing reads negative before the first crossing, then each crossing time")
+print("PASS: crossing times interpolated, and the period measured across evaluations")

@@ -53,7 +53,7 @@ describes, and says nothing about it. One item was in it; it now warns.
 | Feature | Clause | Status |
 | --- | --- | --- |
 | `$discontinuity(n)`, n >= 0 | 9.17.1 | Still dropped, but **no longer silent**: warns as `ignored_discontinuity` (L019). |
-| Analog variable persistence | 4.5.10, 5.10.2 | **Silently wrong.** A variable read before it is assigned in the same evaluation reads its initial value, not the value it held at the end of the previous evaluation. |
+| Analog variable persistence | 4.5.10, 5.10.2 | Fixed. Retention is granted wherever a read can precede its write. |
 
 `hir_lower/src/expr.rs` handles only `$discontinuity(-1)`, the form that belongs
 with `$limit` (9.17.3); every other degree lowers to nothing, because OSDI has no
@@ -68,32 +68,37 @@ making deliberately rather than silently.
 
 ### Analog variable persistence
 
-Found while implementing `last_crossing`, and it is the sharper of the two. A
-variable assigned inside an event handler does retain across timesteps — that is
-the machinery behind `@(cross)` latches, and it covers 5.10.2's `bitErrorRate`
-example (`errors = errors + 1` inside `@(timer(...))`, verified working). What
-does not work is a variable **read before it is assigned** within one evaluation:
-it reads its initialization value instead of what it held last time.
+Found while implementing `last_crossing`, and fixed with it. A variable assigned
+inside an event handler already retained across timesteps — that is the machinery
+behind `@(cross)` latches — but a variable **read before it was assigned** within
+one evaluation read its initialization value instead of what it held last time.
+That is the shape of 4.5.10's own period example, which copies `previous = latest`
+inside the `@(cross)` handler before `latest = last_crossing(...)` runs further
+down the block.
 
-Three probes, driven by a 200 kHz sine and read in ngspice:
+Retention is now decided by a conservative definite-assignment walk over the
+analog block: a write settles a variable for what follows only if it is certain to
+have happened, so anything that may not run — one arm of an `if`, a loop body, an
+event handler — leaves it unsettled, and any read that can come first grants
+retention. That single rule subsumes the old "assigned inside `@(cross)`" rule,
+since a handler may not fire.
 
-| Pattern | Result |
-| --- | --- |
-| `@(cross(..)) n = n + 1;` — handler reads its own retained value | works: 1, 2, 3, 4 |
-| `x = $abstime;` then `@(cross(..)) y = x;` — read after assignment | works |
-| `@(cross(..)) y = x;` then `x = $abstime;` — read before assignment | **always 0** |
+Fixing it required making `@(initial_step)` actually conditional. It had been
+lowered unconditionally, with assignments to retained variables skipped so they
+were not re-applied every evaluation — which silently meant an initializer only
+ever worked if the value it wrote was zero. It is now guarded on a retained
+"first evaluation" flag, so an initializer applies once and retention carries it.
 
-The third is exactly the shape of 4.5.10's own period-measurement example, which
-copies `previous = latest` inside the `@(cross)` handler before `latest =
-last_crossing(...)` runs further down the block. In the LRM's model the analog
-block's variables persist between evaluations, so that read yields the previous
-evaluation's crossing time; here it yields zero and the measured period comes out
-as the absolute crossing time instead. It compiles clean with no diagnostic.
+The blast radius is real and worth knowing. Compact models wrap their parameter
+precomputation in `@(initial_step)`: BSIM4 has ~4000 lines in one, and now
+retains the 319 variables it defines rather than recomputing them on every Newton
+iteration. Verified byte-identical DC sweep and transient output against the
+previous compiler, so the numbers do not move — but instance data grows (~5 kB for
+BSIM4) and the work moves from every evaluation to once per setup. `OSDItemp`
+re-invokes `setup_instance`, so a temperature change re-runs the precomputation.
 
-The mechanism to fix it already exists — retained slots with per-slot initial
-values. What is missing is the analysis: granting retention to any variable whose
-read can be reached without a prior write in the same evaluation. Until then this
-belongs in Tier 1, because the answer is wrong and nothing says so.
+Of ten real compact models compiled before and after, seven were byte-identical;
+BSIM4 grew 5.1%, PSP103 3.1%, HICUML2 1.9%.
 
 ## Tier 2 — monitored events
 
@@ -212,9 +217,9 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 3. ~~**`last_crossing`**~~ — done. Retained state plus linear interpolation;
    4.5.10 does not control the timestep, so it needed no new infrastructure.
    Measures crossings to ~0.2 ps in `sim_regression/last_crossing`.
-4. **Analog variable persistence** — retention for reads that can precede their
-   write. Newly found, silently wrong, and it blocks 4.5.10's own example from
-   giving the right answer even though the function itself is now correct.
+4. ~~**Analog variable persistence**~~ — done. Retention wherever a read can
+   precede its write, plus a conditional `@(initial_step)`. 4.5.10's period
+   example now measures the period.
 5. **`timer`** — retained next-event time plus `bound_step`. First real want of
    the missing breakpoint facility.
 6. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.

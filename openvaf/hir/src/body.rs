@@ -64,6 +64,40 @@ impl<'a> BodyRef<'a> {
         }
     }
 
+    /// The [`Ref`] a path expression names, or `None` when it names something the
+    /// MIR carries no value for -- the node arguments of `V()` and `I()`, a branch,
+    /// a discipline. [`Self::resolve_path`] panics on those, which is right where the
+    /// caller already knows the shape it is looking at, but a walk over arbitrary
+    /// sub-expressions does not.
+    pub fn try_resolve_path(&self, expr: ExprId) -> Option<Ref> {
+        match self.infere.expr_types[expr] {
+            Ty::Var(_, id) => Some(Ref::Variable(Variable { id })),
+            Ty::Param(_, id) => Some(Ref::Parameter(Parameter { id })),
+            Ty::FunctionVar { fun, arg: Some(arg), .. } => {
+                Some(Ref::FunctionArg(FunctionArg { fun_id: fun, arg_id: arg }))
+            }
+            Ty::FunctionVar { fun, .. } => Some(Ref::FunctionReturn(Function { id: fun })),
+            Ty::NatureAttr(_, id) => Some(Ref::NatureAttr(NatureAttribute { id })),
+            _ => self
+                .infere
+                .resolved_calls
+                .get(&expr)
+                .and_then(|resolved| match resolved {
+                    inference::ResolvedFun::Param(param) => Some(Ref::ParamSysFun(*param)),
+                    _ => None,
+                }),
+        }
+    }
+
+    /// Like [`Self::get_expr`], but `None` rather than a panic when the expression is
+    /// a path naming something with no MIR value. See [`Self::try_resolve_path`].
+    pub fn try_get_expr(&self, expr: ExprId) -> Option<Expr<'a>> {
+        if let hir_def::Expr::Path { .. } = self.body.exprs[expr] {
+            return self.try_resolve_path(expr).map(Expr::Read);
+        }
+        Some(self.get_expr(expr))
+    }
+
     fn resolve_path(&self, expr: ExprId) -> Ref {
         match self.infere.expr_types[expr] {
             Ty::Var(_, id) => Ref::Variable(Variable { id }),

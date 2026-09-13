@@ -184,10 +184,22 @@ impl BodyLoweringCtx<'_, '_, '_> {
                     });
 
                 if initial_step {
-                    let prev = self.ctx.in_initial_step;
-                    self.ctx.in_initial_step = true;
-                    self.lower_stmt(body);
-                    self.ctx.in_initial_step = prev;
+                    // Guard the body on a retained "first evaluation" flag so an
+                    // initializer applies once and then lets retention carry it,
+                    // instead of being re-applied on every evaluation. Without
+                    // retained state (the init function, verilogae) there is no flag
+                    // to key on, and the body stays unconditional as before.
+                    if self.ctx.no_equations {
+                        self.lower_stmt(body);
+                    } else {
+                        let first = self.ctx.first_eval();
+                        self.ctx.make_cond(first, |ctx, branch| {
+                            if branch {
+                                BodyLoweringCtx { body: self.body, path: self.path, ctx }
+                                    .lower_stmt(body)
+                            }
+                        });
+                    }
                     return;
                 }
 
@@ -236,21 +248,6 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 self.ctx.def_place(PlaceKind::NamedEvent(event), mir::TRUE);
             }
             Stmt::Assignment { lhs, rhs } => {
-                // A retained variable's `@(initial_step)` reset is its initial value
-                // (already loaded from the retained state); skip it so it is not
-                // re-applied on every evaluation.
-                if self.ctx.in_initial_step {
-                    let retained = match &lhs {
-                        hir::AssignmentLhs::Variable(var)
-                        | hir::AssignmentLhs::ArrayElement { var, .. } => {
-                            self.ctx.retained_states.contains_key(var)
-                        }
-                        _ => false,
-                    };
-                    if retained {
-                        return;
-                    }
-                }
                 // Whole-array assignment (`g = '{1.0, 2.0};` or `g = h;`) writes the
                 // element places directly: an array is not a single MIR value.
                 if let hir::AssignmentLhs::Variable(var) = lhs {

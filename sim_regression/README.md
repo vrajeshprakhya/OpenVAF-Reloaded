@@ -135,15 +135,10 @@ explicit that the function "does not control the timestep to get accurate
 results", so that is all it is entitled to, and on a signal this smooth it is
 plenty.
 
-The model also computes `period` the way 4.5.10's own example does, and the
-analyzer prints it **without asserting on it**: it reads 20 us where it should
-read 5 us. That is not a `last_crossing` defect. The example copies `previous =
-latest` inside the `@(cross)` handler before `latest = last_crossing(...)` runs
-further down the block, so it needs `latest` to still hold the previous
-evaluation's value — and a variable read before it is assigned in an evaluation
-currently reads its initial value instead. See the analog-variable persistence
-section of `docs/lrm-system-level-gaps.md`. The number is printed so it stops
-being wrong visibly, the moment that is fixed.
+The model also measures `period` the way 4.5.10's own example does, and that is
+asserted too: 5.000000 us, exactly. It reads `latest` inside the `@(cross)`
+handler *before* the statement that assigns it, so it only comes out right
+because analog variables now keep their value between evaluations.
 
 ## Why retained state does not live in the OSDI state array
 
