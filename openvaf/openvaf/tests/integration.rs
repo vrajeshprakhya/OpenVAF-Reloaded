@@ -688,6 +688,141 @@ fn test_slew() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 9.13: the probabilistic distributions. 9.13.1 requires that `$random`
+/// "shall always return the same stream of values given the same initial
+/// random_seed", and 9.13.3 fixes which stream by deferring to IEEE 1364 17.9.3 --
+/// so matching other simulators is part of being correct, and the reference values
+/// below were taken from one. See `rng_stream.va`.
+fn test_rng_stream() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    // (kind, seed, [(value, seed after) ...]) per function.
+    let cases: &[(f64, f64, &[(f64, f64)])] = &[
+        (
+            0.0,
+            1.0,
+            &[
+                (-2147414528.0, 69070.0),
+                (-1671855048.0, 475628535.0),
+                (1129920902.0, -1017563188.0),
+                (-1374483364.0, 772999773.0),
+                (1730349006.0, -417135238.0),
+                (1674352583.0, -473131853.0),
+            ],
+        ),
+        (
+            1.0,
+            12345.0,
+            &[
+                (20.0, 852656806.0),
+                (90.0, -438629137.0),
+                (24.0, 1023442532.0),
+                (37.0, 1580485141.0),
+            ],
+        ),
+        (
+            2.0,
+            12345.0,
+            &[
+                (50.0, -438629137.0),
+                (37.0, 1580485141.0),
+                (49.0, -205612757.0),
+                (48.0, 1055483825.0),
+            ],
+        ),
+        (
+            3.0,
+            7.0,
+            &[
+                (45.0, 483484.0),
+                (1.0, -965981971.0),
+                (2.0, -1386778934.0),
+                (2.0, -1368524349.0),
+            ],
+        ),
+        (
+            4.0,
+            7.0,
+            &[
+                (0.0, 483484.0),
+                (6.0, 40936767.0),
+                (1.0, 31362789.0),
+                (2.0, 478906240.0),
+            ],
+        ),
+        (
+            5.0,
+            99.0,
+            &[
+                (6.0, 471364482.0),
+                (1.0, -269253343.0),
+                (7.0, 239310840.0),
+                (2.0, 1843486031.0),
+            ],
+        ),
+        (
+            6.0,
+            99.0,
+            &[
+                (-1.0, -1311147616.0),
+                (-1.0, 1926252953.0),
+                (-1.0, 1221288882.0),
+                (1.0, -1063882643.0),
+            ],
+        ),
+        (
+            7.0,
+            31.0,
+            &[
+                (25.0, 1857510597.0),
+                (4.0, -1344686245.0),
+                (4.0, 2141936993.0),
+                (9.0, 617986135.0),
+            ],
+        ),
+    ];
+
+    for &(kind, seed0, expected) in cases {
+        let desc = test_descriptor(&openvaf_test_data("osdi").join("rng_stream.va"))?;
+        let model = desc.new_model();
+        // Parameter order is $mfactor, seed0, kind -- see rng_stream.snap.
+        model.set_real_param(1, seed0);
+        model.set_real_param(2, kind);
+        model.process_params()?;
+        let mut instance = model.new_instance();
+        let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+        for (step, &(want_val, want_seed)) in expected.iter().enumerate() {
+            if step != 0 {
+                // Only an accepted step advances the seed, which is what makes a
+                // draw stable across the Newton iterations of one timestep.
+                sim.next_iter();
+                sim.advance_time(1e-6);
+            }
+            sim.set_voltage("in", 0.0);
+            sim.set_voltage("val", 0.0);
+            sim.set_voltage("seed_out", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+
+            let got_val = sim.read_residual("flow(val)").0;
+            let got_seed = sim.read_residual("flow(seed_out)").0;
+            assert!(
+                (got_val - want_val).abs() < 1e-6,
+                "kind {kind} draw {step}: value {got_val}, want {want_val}"
+            );
+            assert!(
+                (got_seed - want_seed).abs() < 1e-6,
+                "kind {kind} draw {step}: seed {got_seed}, want {want_seed}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// VAMS-2023 5.10.3.3: `timer` fires at `start_time` and every `period` after it,
 /// and a period of zero or less fires once. See `timer_detect.va`.
 ///
@@ -1010,5 +1145,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream)]
 }

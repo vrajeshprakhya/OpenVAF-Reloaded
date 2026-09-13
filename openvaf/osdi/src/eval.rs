@@ -365,6 +365,27 @@ impl<'ll> OsdiCompilationUnit<'_, '_, 'll> {
                         num_state: 0,
                     })
                 }
+                CallBackKind::RngValue(dist) | CallBackKind::RngSeed(dist) => {
+                    let name = if matches!(kind, CallBackKind::RngValue(_)) {
+                        "rng_value"
+                    } else {
+                        "rng_seed"
+                    };
+                    let fun = builder
+                        .cx
+                        .get_func_by_name(name)
+                        .unwrap_or_else(|| panic!("stdlib function {name} is missing"));
+                    let fun_ty = cx.ty_func(
+                        &[cx.ty_int(), cx.ty_double(), cx.ty_double(), cx.ty_double()],
+                        cx.ty_double(),
+                    );
+                    CallbackFun::Prebuilt(BuiltCallbackFun {
+                        fun_ty,
+                        fun,
+                        state: Box::new([cx.const_unsigned_int(dist as u32)]),
+                        num_state: 0,
+                    })
+                }
                 CallBackKind::StoreRetained(state) => {
                     let fun = builder
                         .cx

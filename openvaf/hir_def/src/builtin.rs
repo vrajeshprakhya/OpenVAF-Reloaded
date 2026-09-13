@@ -208,23 +208,7 @@ impl BuiltIn {
             | BuiltIn::fflush
             | BuiltIn::ferror
             | BuiltIn::feof
-            | BuiltIn::fdebug
-            | BuiltIn::dist_chi_square
-            | BuiltIn::dist_exponential
-            | BuiltIn::dist_poisson
-            | BuiltIn::dist_uniform
-            | BuiltIn::dist_erlang
-            | BuiltIn::dist_normal
-            | BuiltIn::dist_t
-            | BuiltIn::random
-            | BuiltIn::arandom
-            | BuiltIn::rdist_chi_square
-            | BuiltIn::rdist_exponential
-            | BuiltIn::rdist_poisson
-            | BuiltIn::rdist_uniform
-            | BuiltIn::rdist_erlang
-            | BuiltIn::rdist_normal
-            | BuiltIn::rdist_t => true,
+            | BuiltIn::fdebug => true,
             _ => false,
         }
     }

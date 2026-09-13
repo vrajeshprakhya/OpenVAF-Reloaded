@@ -205,14 +205,13 @@ the `UNSUPPORTED` list at `sourcegen/src/hir_builtins.rs:29`.
 | Feature | Clause | What it blocks |
 | --- | --- | --- |
 | `zi_nd`, `zi_np`, `zi_zd`, `zi_zp` | 4.5.12 | Linear discrete-time filters. Sampled-data systems, digital filter models, sigma-delta modulators, any DSP chain. A unity Z-filter is a sample-and-hold with period T. |
-| `$random`, `$arandom`, `$dist_*`, `$rdist_*` | 9.13 | Jitter, noise injection, mismatch, Monte-Carlo. |
 | `$table_model` | 9.21 | Data-driven behavioral models from swept or measured data. Not merely unsupported: the name is commented out of the sysfun list (`hir_builtins.rs:207`), so it does not resolve at all. |
 | `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fmonitor`, `$fscanf`, `$fgets`, `$sformat`, `$swrite`, `$sscanf`, `$fseek`, `$ftell`, `$feof`, … | 9.5 | File-driven stimulus and result logging — the normal way a system-level testbench gets vectors in and measurements out. |
 | `$simprobe` | 9.16 | Probing another instance's signals. |
 | `$analog_node_alias`, `$analog_port_alias` | 9.20 | Node aliasing. |
 | `$test$plusargs`, `$value$plusargs` | 9.12 | Command-line configuration of a model. |
 
-Two of these interact in a way worth calling out. 5.10.3.3's own PRBS generator
+Two of these interacted in a way worth calling out, and both halves now work. 5.10.3.3's own PRBS generator
 example is:
 
 ```verilog
@@ -223,15 +222,41 @@ analog begin
 end
 ```
 
-The LRM's canonical `timer` example cannot be written today for two independent
-reasons — `timer` does not schedule, and `$random` does not exist.
+That example could not be written at all: `timer` did not schedule and `$random`
+did not exist. Both are now implemented, so it runs.
 
-`$random` also deserves a note on ordering. Its seed is an inout integer that the
-function mutates, so calling it in straight-line analog code re-randomizes on
-every Newton iteration and will not converge. It is only meaningful inside a
-scheduled event body, which makes it dependent on Tier 2. It also needs
-per-instance seed storage, and the instance-data pattern added for retained state
-is the right home for that.
+The convergence concern turned out to be handled by the retained-state machinery
+rather than needing anything new. The seed is an inout integer the function
+mutates, so calling it in straight-line analog code would re-randomize on every
+Newton iteration. But a seed variable is read before it is written, which earns
+it retention, and a retained slot only commits when time advances — so every
+iteration of one timestep reads the same committed seed and draws the same
+number. A seed that is a parameter, a constant, or absent gets a retained slot of
+its own, seeded from the expression on the first evaluation, per 9.13.2's "an
+internal seed is created which is assigned the initial value".
+
+9.13.3 does not spell the algorithm out; it defers to IEEE 1364 17.9.3, and
+9.13.1 requires that `$random` "shall always return the same stream of values
+given the same initial random_seed". Matching other simulators is therefore part
+of being correct, so the implementation is checked against one: all eight
+functions, 34 draws, values and advanced seeds alike, in
+`openvaf/test_data/osdi/rng_stream.va`.
+
+### Found while testing: `case` arms and analog operators
+
+Two analog operators in different arms of a `case` statement crash the compiler.
+`transition()` trips it as readily as the distributions do, and predates them:
+
+```verilog
+case (kind)
+    0: val = transition(V(in) > 0.5, 0, 1n);
+    default: val = transition(V(in) > 0.2, 0, 2n);
+endcase
+```
+
+The same pair written as `if`/`else` compiles and runs. Not in Tier 1 because it
+is a crash rather than a wrong answer, but it is the kind of thing a model writer
+hits without warning.
 
 ## Tier 4 — language and grammar
 
@@ -271,8 +296,8 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
    verified against ngspice with no clock node in the netlist.
 6. ~~**Close the `cross` tolerance box**~~ — done. Predictive `bound_step` from
    the extrapolated crossing; the sample-and-hold residual is now 0.00e+00 V.
-7. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
-   after 5.
+7. ~~**`$random` / `$dist_*`**~~ — done. All eight functions, verified against
+   the stream IEEE 1364 17.9.3 specifies.
 8. **Z-transform filters** — retained state plus T-periodic sampling plus
    `transition`, so largely a composition of 3, 5 and what already exists.
 9. **`` `default_transition `` / `` `default_discipline ``** — independent,

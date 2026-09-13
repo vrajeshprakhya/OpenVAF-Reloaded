@@ -25,7 +25,7 @@ const ANALOG_OPERATORS: [&str; 17] = [
     "transition",
 ];
 
-const UNSUPPORTED: [&str; 43] = [
+const UNSUPPORTED: [&str; 27] = [
     "simprobe",
     "analog_node_alias",
     "analog_port_alias",
@@ -53,22 +53,6 @@ const UNSUPPORTED: [&str; 43] = [
     "ferror",
     "feof",
     "fdebug",
-    "dist_chi_square",
-    "dist_exponential",
-    "dist_poisson",
-    "dist_uniform",
-    "dist_erlang",
-    "dist_normal",
-    "dist_t",
-    "random",
-    "arandom",
-    "rdist_chi_square",
-    "rdist_exponential",
-    "rdist_poisson",
-    "rdist_uniform",
-    "rdist_erlang",
-    "rdist_normal",
-    "rdist_t",
 ];
 
 const ANALOG_OPERATORS_SYSFUN: [&str; 1] = ["$limit"];

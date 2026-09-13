@@ -248,6 +248,8 @@ pub fn general_callbacks<'ll>(
                 | CallBackKind::BuiltinLimit { .. }
                 | CallBackKind::StoreLimit(_)
                 | CallBackKind::StoreRetained(_)
+                | CallBackKind::RngValue(_)
+                | CallBackKind::RngSeed(_)
                 | CallBackKind::LimDiscontinuity
                 | CallBackKind::Analysis
                 | CallBackKind::NoiseTable(_)
