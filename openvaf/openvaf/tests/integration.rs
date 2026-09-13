@@ -688,6 +688,64 @@ fn test_slew() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 5.10.3.3: `timer` fires at `start_time` and every `period` after it,
+/// and a period of zero or less fires once. See `timer_detect.va`.
+///
+/// The mock simulator does not act on `bound_step`, so the steps here land on the
+/// event times by construction; `sim_regression` covers the part where the solver
+/// has to be steered onto them.
+fn test_timer_detect() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let run = |period: f64, steps: usize| -> Result<Vec<(f64, f64)>> {
+        let desc = test_descriptor(&openvaf_test_data("osdi").join("timer_detect.va"))?;
+        let model = desc.new_model();
+        // Parameter order is $mfactor, start, period -- see timer_detect.snap.
+        model.set_real_param(2, period);
+        model.process_params()?;
+        let mut instance = model.new_instance();
+        let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+        let mut out = Vec::new();
+        for step in 0..steps {
+            if step != 0 {
+                sim.next_iter();
+                sim.advance_time(1e-6);
+            }
+            // A distinct input per step, so the sampled value names the step it came
+            // from: 0, 1, 2 ... at t = 0, 1 us, 2 us ...
+            sim.set_voltage("in", step as f64);
+            sim.set_voltage("held", 0.0);
+            sim.set_voltage("count", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+            out.push((sim.read_residual("flow(held)").0, sim.read_residual("flow(count)").0));
+        }
+        Ok(out)
+    };
+
+    // start = 2 us, period = 2 us: events at 2 us and 4 us, nothing before or between.
+    let periodic = run(2e-6, 6)?;
+    let expected = [(0.0, 0.0), (0.0, 0.0), (2.0, 1.0), (2.0, 1.0), (4.0, 2.0), (4.0, 2.0)];
+    for (got, want) in periodic.iter().zip(expected) {
+        float_cmp::assert_approx_eq!(f64, got.0, want.0, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got.1, want.1, epsilon = 1e-9);
+    }
+
+    // "If the period expression evaluates to a value less than or equal to 0.0, the
+    // timer shall trigger only once at the specified start_time."
+    let once = run(0.0, 6)?;
+    let expected = [(0.0, 0.0), (0.0, 0.0), (2.0, 1.0), (2.0, 1.0), (2.0, 1.0), (2.0, 1.0)];
+    for (got, want) in once.iter().zip(expected) {
+        float_cmp::assert_approx_eq!(f64, got.0, want.0, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got.1, want.1, epsilon = 1e-9);
+    }
+
+    Ok(())
+}
+
 /// VAMS-2023: analog block variables keep their value between evaluations, so a
 /// read can precede the statement that assigns it and pick up the previous
 /// evaluation's value. See `var_persistence.va` for the three shapes checked here.
@@ -952,5 +1010,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect)]
 }

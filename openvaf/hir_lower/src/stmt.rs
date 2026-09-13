@@ -20,6 +20,93 @@ impl BodyLoweringCtx<'_, '_, '_> {
         self.lower_select_with(a, |_| TRUE, |_| b)
     }
 
+    /// VAMS-2023 5.10.3.3: whether `timer(start_time, period, time_tol, enable)`
+    /// fires in this evaluation.
+    ///
+    /// Unlike `cross`, this one gets to *ask* for the timepoint. `$bound_step` is
+    /// capped at the distance remaining to the next event, which lands ngspice on it
+    /// exactly -- measured, not assumed: `$abstime - t_event` comes back as
+    /// identically zero. A step the solver shortens for its own reasons costs
+    /// nothing, since the cap is recomputed, closer, on the next evaluation.
+    ///
+    /// That is also why `time_tol` is accepted and then ignored. The clause asks the
+    /// simulator to place a point "within time_tol of an event"; placing it exactly
+    /// on the event satisfies any tolerance.
+    fn lower_timer(&mut self, args: &[ExprId]) -> Option<Value> {
+        let start = *args.first()?;
+        if self.body.is_missing(start) {
+            return None;
+        }
+        let start = self.lower_expr(start);
+        let period = match args.get(1) {
+            Some(&p) if !self.body.is_missing(p) => self.lower_expr(p),
+            _ => F_ZERO,
+        };
+        let now = self.ctx.use_param(ParamKind::Abstime);
+
+        // The next scheduled event. Negative means "not scheduled yet", which no real
+        // event time can be, so the first evaluation picks up `start_time`.
+        let state = self.ctx.alloc_retained_state(-1.0);
+        let prev = self.ctx.retained_prev(state);
+        let unscheduled = self.ctx.ins().flt(prev, F_ZERO);
+        let next = self.ctx.make_select(unscheduled, |_s, taken| if taken { start } else { prev });
+
+        let reached = self.ctx.ins().fge(now, next);
+
+        // "If the period expression evaluates to a value less than or equal to 0.0,
+        // the timer shall trigger only once at the specified start_time." A
+        // non-periodic timer that has fired is parked beyond any simulation time.
+        let periodic = self.ctx.ins().fgt(period, F_ZERO);
+        let never = self.ctx.fconst(f64::MAX);
+        let one = self.ctx.fconst(1.0);
+        // Pin the divisor when there is no period: the division is evaluated either
+        // way and only the `periodic` arm keeps its result.
+        let divisor = self.ctx.make_select(periodic, |_s, taken| if taken { period } else { one });
+        // Skip whole periods in case the solver got past several at once:
+        //   next + period * (floor((now - next) / period) + 1)
+        let elapsed = self.ctx.ins().fsub(now, next);
+        let periods = self.ctx.ins().fdiv(elapsed, divisor);
+        let periods = self.ctx.ins().floor(periods);
+        let periods = self.ctx.ins().fadd(periods, one);
+        let advance = self.ctx.ins().fmul(period, periods);
+        let after = self.ctx.ins().fadd(next, advance);
+        let after = self.ctx.make_select(periodic, |_s, taken| if taken { after } else { never });
+
+        // The schedule advances whether or not `enable` lets the event through: "it
+        // will start generating events once enable returns to being nonzero as if it
+        // had never been disabled."
+        let new_next = self.ctx.make_select(reached, |_s, taken| if taken { after } else { next });
+        self.ctx.store_retained(state, new_next);
+
+        // "If enable argument is specified and it is zero, then timer() is inactive,
+        // meaning that it does not generate events as long as enable is zero."
+        let enabled = match args.get(3) {
+            Some(&en) if !self.body.is_missing(en) => {
+                let en = self.lower_expr(en);
+                let zero = self.ctx.iconst(0);
+                Some(self.ctx.ins().ine(en, zero))
+            }
+            _ => None,
+        };
+
+        // Ask for a timepoint on the next event, but not while inactive -- a disabled
+        // timer should not be steering the timestep either.
+        let remaining = self.ctx.ins().fsub(new_next, now);
+        let due = self.ctx.ins().fgt(remaining, F_ZERO);
+        let due = match enabled {
+            Some(en) => self.and(due, en),
+            None => due,
+        };
+        let bound = self.ctx.make_select(due, |_s, taken| if taken { remaining } else { never });
+        self.bound_step(bound);
+
+        let fired = match enabled {
+            Some(en) => self.and(reached, en),
+            None => reached,
+        };
+        Some(fired)
+    }
+
     /// VAMS-2023 5.10.3.1/5.10.3.2: whether `cross` or `above` fires in this
     /// evaluation.
     ///
@@ -49,11 +136,13 @@ impl BodyLoweringCtx<'_, '_, '_> {
         };
         // Argument layout per function: `cross(expr, dir, time_tol, expr_tol,
         // enable)` against `above(expr, time_tol, expr_tol, enable)` -- `above` has
-        // no direction, so `enable` sits one place earlier. `timer` and `absdelta`
-        // need breakpoints and delta tracking of their own; they stay unscheduled.
+        // no direction, so `enable` sits one place earlier. `timer` schedules on
+        // absolute time instead of a crossing and has its own lowering; `absdelta`
+        // stays unscheduled.
         let (dir_arg, enable_arg) = match fun {
             BuiltIn::cross => (Some(1), 4),
             BuiltIn::above => (None, 3),
+            BuiltIn::timer => return self.lower_timer(args),
             _ => return None,
         };
 

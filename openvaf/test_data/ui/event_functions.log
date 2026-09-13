@@ -1,43 +1,3 @@
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions.va:45:9
-   |
-45 |         @(timer(0.0)) y = 10.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions.va:46:9
-   |
-46 |         @(timer(0.0, period)) y = 11.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions.va:47:9
-   |
-47 |         @(timer(0.0, period, ttol)) y = 12.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions.va:48:9
-   |
-48 |         @(timer(0.0, period, ttol, enable)) y = 13.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
 warning[L018]: 'absdelta' does not schedule an event yet
    --> /event_functions.va:51:9
    |
@@ -73,16 +33,6 @@ warning[L018]: 'absdelta' does not schedule an event yet
    |
 54 |         @(absdelta(V(d), delta, ttol, etol, enable)) y = 17.0;
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions.va:58:9
-   |
-58 |         @(timer(1, 2)) y = 19.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
    |
    = the event expression is checked but takes no part in scheduling
    = the guarded statement runs on every evaluation, not per event

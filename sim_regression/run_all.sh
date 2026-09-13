@@ -45,5 +45,6 @@ run() {
 run sample_hold   sample_hold   sh_out.txt analyze_sample_hold.py
 run above_init    above_init    ai_out.txt analyze_above_init.py
 run last_crossing last_crossing lc_out.txt analyze_last_crossing.py
+run timer         timer         tm_out.txt analyze_timer.py
 
 exit $fail

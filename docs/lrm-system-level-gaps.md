@@ -132,8 +132,8 @@ BSIM4 grew 5.1%, PSP103 3.1%, HICUML2 1.9%.
 | --- | --- | --- |
 | `cross` | 5.10.3.1 | Works. Detects the crossing and guards the body. |
 | `above` | 5.10.3.2 | Works. Rising-only, plus the initialization event. |
-| `timer` | 5.10.3.3 | Parses and type-checks, **body runs every evaluation** (warns `L018`). |
-| `absdelta` | 5.10.3.4 | Same — but see the note below. |
+| `timer` | 5.10.3.3 | Works. Fires at `start_time` and every `period` after it. |
+| `absdelta` | 5.10.3.4 | Parses and type-checks, **body runs every evaluation** (warns `L018`) — but see the note below. |
 
 `above` shares `cross`'s crossing detection, with two differences the LRM is
 explicit about: no `dir` argument, so it triggers only from below, and it also
@@ -156,9 +156,19 @@ retained state while time stands still. 5.10.3.2 asks for crossings there and
 does not control the sweep step to resolve them, so over-firing samples the same
 value a crossing would.
 
-`timer` needs a next-event time in retained state and a `bound_step` capped at
-`next_event - now`, which places the point exactly (see the table above). No ABI
-change required.
+`timer` keeps its next event time in a retained slot and caps `$bound_step` at
+the distance remaining, which is the one place a model gets to *ask* for a
+timepoint rather than wait for one. `sim_regression/timer` samples a ramp with no
+clock node anywhere in the netlist: all five event instants land exactly, the
+held values are exact to 0.00e+00 V, and exactly five events fire — no
+double-firing across the Newton iterations of the step an event lands on.
+
+That is also why `time_tol` is accepted and then ignored. 5.10.3.3 asks the
+simulator to place a point "within time_tol of an event"; placing it exactly on
+the event satisfies any tolerance. One deviation worth recording: the LRM says a
+`start_time` that changes mid-simulation reschedules the next event, and this
+reads `start_time` only while nothing is scheduled yet. `period` is re-read every
+evaluation, so a changing period does follow the clause.
 
 `absdelta` is worth a scoping decision rather than an implementation. 5.10.3.4
 says it "is only allowed in an initial or always block of a Verilog-AMS module":
@@ -244,10 +254,10 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 4. ~~**Analog variable persistence**~~ — done. Retention wherever a read can
    precede its write, plus a conditional `@(initial_step)`. 4.5.10's period
    example now measures the period.
-5. **`timer`** — retained next-event time plus a `bound_step` capped at the
-   distance remaining. Places the point exactly; no ABI change needed.
+5. ~~**`timer`**~~ — done. Retained next-event time plus a capped `bound_step`;
+   verified against ngspice with no clock node in the netlist.
 6. **Close the `cross` tolerance box** — same `bound_step` trick, driven from the
-   pending crossing instead of a fixed instant.
+   pending crossing instead of a fixed instant. Now the obvious next step.
 7. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
    after 5.
 8. **Z-transform filters** — retained state plus T-periodic sampling plus

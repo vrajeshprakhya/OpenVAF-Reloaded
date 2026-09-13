@@ -244,7 +244,7 @@ impl BuiltIn {
     #[allow(clippy::match_like_matches_macro)]
     pub fn schedules_event(self) -> bool {
         match self {
-            BuiltIn::cross | BuiltIn::above => true,
+            BuiltIn::cross | BuiltIn::above | BuiltIn::timer => true,
             _ => false,
         }
     }

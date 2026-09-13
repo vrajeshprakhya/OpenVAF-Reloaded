@@ -256,6 +256,21 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
         }
     }
 
+    /// Bound the next timestep (VAMS-2023 9.17.2). Each call bounds it, so the
+    /// effective bound is the smallest of them -- `$bound_step` is not an assignment.
+    /// The place is only read back once an earlier call has declared it, so a module
+    /// with a single call (the common case) lowers exactly as it did before.
+    pub fn bound_step(&mut self, step_size: Value) {
+        let step_size = if self.ctx.get_place(PlaceKind::BoundStep).is_some() {
+            let prev = self.ctx.use_place(PlaceKind::BoundStep);
+            let smaller = self.ctx.ins().flt(step_size, prev);
+            self.lower_select_with(smaller, |_| step_size, |_| prev)
+        } else {
+            step_size
+        };
+        self.ctx.def_place(PlaceKind::BoundStep, step_size);
+    }
+
     pub fn nodes_from_args(
         &mut self,
         args: &[ExprId],

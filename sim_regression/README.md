@@ -25,6 +25,7 @@ PATH=$HOME/ngspice-install/bin:$PATH ./sim_regression/run_all.sh
 sample_hold    PASS
 above_init     PASS
 last_crossing  PASS
+timer          PASS
 ```
 
 Or one at a time:
@@ -46,6 +47,11 @@ cd ../last_crossing
 ../../target/release/openvaf-r last_crossing.va -o last_crossing.osdi
 ngspice -b last_crossing.cir
 python3 ../analyze_last_crossing.py
+
+cd ../timer
+../../target/release/openvaf-r timer.va -o timer.osdi
+ngspice -b timer.cir
+python3 ../analyze_timer.py
 ```
 
 Each analyzer exits non-zero on failure.
@@ -139,6 +145,26 @@ The model also measures `period` the way 4.5.10's own example does, and that is
 asserted too: 5.000000 us, exactly. It reads `latest` inside the `@(cross)`
 handler *before* the statement that assigns it, so it only comes out right
 because analog variables now keep their value between evaluations.
+
+## timer — passing
+
+`timer(1u, 2u)` sampling a ramp, with **no clock node anywhere in the netlist**.
+Every other test here has an edge for the solver to find; this one has nothing to
+find, so the only way a timepoint lands on an event is `$bound_step` asking for
+it.
+
+```
+event instants placed as exact timepoints:
+    1.0us : yes      3.0us : yes      5.0us : yes      7.0us : yes      9.0us : yes
+value held after each event:
+  after   1.0us : v(out)=0.500000  want 0.500000  ticks=1
+  after   9.0us : v(out)=4.500000  want 4.500000  ticks=5
+worst held-value error : 0.00e+00 V
+total events fired     : 5  (want 5)
+```
+
+The tick count is the part that would catch a subtler bug than "no event": one
+event per period, not one per Newton iteration of the step it lands on.
 
 ## Why retained state does not live in the OSDI state array
 

@@ -80,7 +80,7 @@ const EVENT_FUNS: [&str; 4] = ["cross", "above", "timer", "absdelta"];
 // The subset of EVENT_FUNS that actually takes part in scheduling, i.e. decides
 // whether the body of its event control runs. The rest are accepted and
 // type-checked but leave the body unconditional; `unscheduled_event` warns.
-const SCHEDULING_EVENT_FUNS: [&str; 2] = ["cross", "above"];
+const SCHEDULING_EVENT_FUNS: [&str; 3] = ["cross", "above", "timer"];
 
 const ANALYSIS_FUNS: [&str; 6] =
     ["analysis", "ac_stim", "noise_table", "noise_table_log", "white_noise", "flicker_noise"];

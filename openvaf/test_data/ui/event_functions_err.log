@@ -44,16 +44,6 @@ warning[L018]: 'absdelta' does not schedule an event yet
    = the guarded statement runs on every evaluation, not per event
    = unscheduled_event is set to warn by default
 
-warning[L018]: 'timer' does not schedule an event yet
-   --> /event_functions_err.va:24:9
-   |
-24 |         @(timer(nonexistent_name, also_bogus)) y = 4.0;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ body is evaluated unconditionally
-   |
-   = the event expression is checked but takes no part in scheduling
-   = the guarded statement runs on every evaluation, not per event
-   = unscheduled_event is set to warn by default
-
 error: event function 'cross' is not allowed here
    --> /event_functions_err.va:30:13
    |
