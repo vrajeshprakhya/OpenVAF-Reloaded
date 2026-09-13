@@ -15,35 +15,58 @@ needs are spread across 4.5 (analog operators), 5.10 (analog events), 9.5, 9.13,
 are mixed-signal: they need a digital engine and are out of scope for an
 analog-only OSDI flow.
 
-## The one structural blocker
+## What OSDI does not expose, and how much of it matters
 
-Most of what follows is not independent work. OSDI 0.4 gives a model no way to
-say anything to the *integrator*. The descriptor
+OSDI 0.4 gives a model no way to say anything to the *integrator*. The descriptor
 (`openvaf/osdi/header/osdi_0_4.h:204-236`) has `eval`, the loads, setup, given
-flags and noise, and nothing else. It specifically lacks:
+flags and noise, and nothing else. ngspice has all three of the missing pieces
+internally; none of them is reachable across the ABI.
 
-- **an "accepted timestep" callback.** ngspice calls one per device
-  (`DEVaccept`, e.g. `src/spicelib/devices/vsrc/vsrcacct.c`); OSDI exposes none.
-- **a way to request a breakpoint.** ngspice has `CKTsetBreak(ckt, t)` and its
-  own sources use it; OSDI cannot reach it.
-- **a way to announce a discontinuity.** The only return channel is
-  `EVAL_RET_FLAG_LIM`, which ngspice turns into `CKTnoncon++`
-  (`src/osdi/osdiload.c:257`) — one more Newton iteration, not an integrator
-  history reset plus a breakpoint.
+| What a model needs | ngspice has it as | OSDI exposes | Workable substitute |
+| --- | --- | --- | --- |
+| Know a timestep was accepted | `DEVaccept` (e.g. `vsrcacct.c`) | nothing | `$abstime` movement — what retained state uses |
+| Land a point at an exact time | `CKTsetBreak(ckt, t)` | nothing | **`bound_step`, and it works** |
+| Announce a discontinuity | breakpoint + `CKTorder = 1` | `EVAL_RET_FLAG_LIM` only, which is `CKTnoncon++` | none |
 
-Three separate LRM features reduce to that single missing facility: retained
-state commit (worked around with `$abstime` — see `sim_regression/README.md`),
-`timer` breakpoints, and `$discontinuity`.
+The middle row is the one that decides how much of this matters, so it was
+measured rather than assumed. A model that caps `$bound_step` at the distance
+remaining to a chosen instant makes ngspice land on it exactly:
 
-`bound_step` is the one channel that does exist, and ngspice honours it
-(`src/osdi/osditrunc.c`), so it can *approximate* breakpoints by capping the
-step. That is the basis for most of the work below, but it cannot place a point
-at an exact time.
+```
+event at 3.7us          WITH bound_step        WITHOUT
+                          3.456000000 us        3.456000000 us
+                          3.500000000 us
+                          3.588000000 us
+                          3.700000000 us   <--  3.656000000 us
+                          3.900000000 us        3.856000000 us
+                        61 points total       59 points total
+```
+
+So `bound_step` is a working stand-in for `CKTsetBreak` as far as *placing* a
+point goes, at a cost of a couple of extra timepoints. `timer` (5.10.3.3) needs
+no ABI change, and neither does tightening `cross` into its `time_tol` box.
+
+What `bound_step` cannot do is the other half of a breakpoint: ngspice cuts the
+integration order to 1 at one (`dctran.c:493`), and capping a step does not. That
+is why `$discontinuity` has no substitute — the integrator keeps extrapolating
+across a jump with a history that no longer describes the waveform. It still
+converges, by rejecting steps and shrinking until it gets through; it is a cost
+and an accuracy risk at the jump, not a wall.
+
+For system-level modelling specifically, that residue is small, because the
+idiomatic style avoids it. 9.17.1 itself says discontinuity "created by switch
+branches and filters, such as `transition()` and `slew()`, does not need to be
+announced" — and smoothing edges with `transition()` is how behavioural models
+are meant to be written. Clocks are the other case, and in a SPICE flow they
+usually come from a real source: `vsrc` calls `CKTsetBreak` for its own corners,
+so `@(cross)` on a clock node already gets breakpoint-placed edges for free.
 
 An OSDI proposal for an accept callback plus a breakpoint/discontinuity request
-is therefore the highest-leverage item here. The precedent for how it should look
-is `absdelay`: a descriptor-level protocol where the simulator owns the
-time-dependent part.
+is still worth making — it would retire the `$abstime` workaround, let
+`$discontinuity` mean something, and cost fewer timepoints than capping. But it
+gates far less than it first appears: it is a cleanup, not a prerequisite. The
+precedent for how it should look is `absdelay`: a descriptor-level protocol where
+the simulator owns the time-dependent part.
 
 ## Tier 1 — accepted but not honoured
 
@@ -61,10 +84,13 @@ channel to announce a discontinuity. It now says so, points at `$bound_step` as
 the thing that does reach the simulator, and notes that the `-1` form is
 supported — so a model can no longer claim a discontinuity that never arrives.
 
-Actually announcing it still needs the OSDI facility below. Driving `bound_step`
-down across the jump would be a partial answer, but the degree argument carries
-no time, so the cap would have to be invented; that is a policy decision worth
-making deliberately rather than silently.
+Actually announcing it needs the OSDI facility described above, and it is the one
+item on this page with no substitute: `bound_step` can cap a step but cannot cut
+the integration order, which is the half of a breakpoint that matters at a jump.
+Capping across the jump anyway would be a partial answer, but the degree argument
+carries no time, so the cap would have to be invented — a policy decision worth
+taking deliberately rather than silently. A model that smooths its edges with
+`transition()` or `slew()` needs none of this; 9.17.1 says so itself.
 
 ### Analog variable persistence
 
@@ -131,10 +157,8 @@ does not control the sweep step to resolve them, so over-firing samples the same
 value a crossing would.
 
 `timer` needs a next-event time in retained state and a `bound_step` capped at
-`next_event - now`. It is the first feature to really want the missing breakpoint
-facility, since `bound_step` lands the point at or just before the event rather
-than within `time_tol` of it — acceptable under 5.10.3.3's "at, or just beyond,
-the time of the event" only if the cap is tight.
+`next_event - now`, which places the point exactly (see the table above). No ABI
+change required.
 
 `absdelta` is worth a scoping decision rather than an implementation. 5.10.3.4
 says it "is only allowed in an initial or always block of a Verilog-AMS module":
@@ -220,11 +244,10 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 4. ~~**Analog variable persistence**~~ — done. Retention wherever a read can
    precede its write, plus a conditional `@(initial_step)`. 4.5.10's period
    example now measures the period.
-5. **`timer`** — retained next-event time plus `bound_step`. First real want of
-   the missing breakpoint facility.
-6. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
-   Unblocks 1 and 5, closes the `cross` tolerance box, and lets the `$abstime`
-   retained-state workaround retire.
+5. **`timer`** — retained next-event time plus a `bound_step` capped at the
+   distance remaining. Places the point exactly; no ABI change needed.
+6. **Close the `cross` tolerance box** — same `bound_step` trick, driven from the
+   pending crossing instead of a fixed instant.
 7. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
    after 5.
 8. **Z-transform filters** — retained state plus T-periodic sampling plus
@@ -232,3 +255,7 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 9. **`` `default_transition `` / `` `default_discipline ``** — independent,
    small, and immediately visible to model writers.
 10. **`$table_model`, then file I/O** — the two largest self-contained items.
+11. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
+    Deliberately last: it would retire the `$abstime` workaround, give
+    `$discontinuity` something to say, and cost fewer timepoints than capping,
+    but nothing above is waiting on it.
