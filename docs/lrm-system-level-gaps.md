@@ -176,13 +176,26 @@ it is a digital-side sampler for converting analog signals into real-typed
 digital variables. Accepting it in an analog block, as today, is not something
 the LRM sanctions. Consider rejecting it in Verilog-A instead of implementing it.
 
-### Accuracy, not presence
+### Accuracy
 
-`cross` fires on the first accepted step after the crossing, not inside the
-`time_tol`/`expr_tol` box that 5.10.3.1 Figure 5-6 requires ("the event shall
-occur after the threshold crossing, and while the signal remains in the box").
-Measured residual in `sim_regression`: 7.5e-05 V on a 0.5 V/us ramp. Closing it
-means driving `bound_step` from the pending crossing.
+`cross` and `above` now steer the timestep onto the crossing, which is what
+5.10.3.1 means by "in addition, cross() controls the timestep to accurately
+resolve the crossing". Detection alone could not: by the time two accepted points
+straddle zero the crossing is behind us, and a model cannot ask for a step to be
+rejected. So it predicts instead — the expression's rate over the last accepted
+step extrapolates to the time it reaches zero, and `$bound_step` caps the next
+step there. Each capped step lands closer, so the estimate sharpens as it
+approaches.
+
+`time_tol` is the floor that stops the refinement, which is also what "within
+time_tol of the crossing" buys. With none given the tool picks one, as the clause
+allows: a thousandth of the step already being taken, relative to whatever scale
+the solver is working at and unable to collapse towards zero on its own.
+
+The residual in `sim_regression/sample_hold` went from 7.5e-05 V to **0.00e+00**,
+and `last_crossing`, which reads a `@(cross)`-driven sampler, from 2e-13 s to
+0.00e+00 as a side effect. The tolerance there is now 1e-06 V, a thousand times
+tighter than before, and the previous compiler fails it at 7.50e-05 V.
 
 ## Tier 3 — hard errors that block whole model classes
 
@@ -256,8 +269,8 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
    example now measures the period.
 5. ~~**`timer`**~~ — done. Retained next-event time plus a capped `bound_step`;
    verified against ngspice with no clock node in the netlist.
-6. **Close the `cross` tolerance box** — same `bound_step` trick, driven from the
-   pending crossing instead of a fixed instant. Now the obvious next step.
+6. ~~**Close the `cross` tolerance box**~~ — done. Predictive `bound_step` from
+   the extrapolated crossing; the sample-and-hold residual is now 0.00e+00 V.
 7. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
    after 5.
 8. **Z-transform filters** — retained state plus T-periodic sampling plus

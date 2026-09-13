@@ -31,7 +31,9 @@ run() {
         return
     fi
 
-    "$NG" -b "$model.cir" > "$out" 2>&1
+    # ngspice's console output goes to its own file: `wrdata` is already writing
+    # "$out", and letting both land in one file interleaves the log into the data.
+    "$NG" -b "$model.cir" > "$model.log" 2>&1
 
     if log=$(python3 "../$analyzer" 2>&1); then
         printf '%-14s PASS\n' "$dir"

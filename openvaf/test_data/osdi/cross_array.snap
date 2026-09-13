@@ -8,4 +8,4 @@ node "q1" units = "V", runits = "A"
 jacobian (q0, q0) JacobianFlags(JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST | JACOBIAN_ENTRY_REACT_CONST)
 jacobian (q1, q1) JacobianFlags(JACOBIAN_ENTRY_RESIST | JACOBIAN_ENTRY_RESIST_CONST | JACOBIAN_ENTRY_REACT_CONST)
 0 states
-has bound_step false
+has bound_step true

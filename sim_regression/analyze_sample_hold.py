@@ -16,12 +16,15 @@ Exits non-zero if either check fails.
 import sys
 
 THRESH = 2.5
-# `transition(state, 0, 10n)` plus the local timestep: ignore this much after an
-# edge when asking whether the output is holding steady.
-SETTLE = 100e-9
-# v(in) ramps at 0.5 V/us and the event can land one accepted step (<= 10 ns
-# requested, but the integrator may take more) after the crossing.
-SAMPLE_TOL = 1e-3
+# `transition(state, 0, 10n)` is a continuous lag, so it approaches the sampled
+# value asymptotically rather than arriving in exactly 10 ns. 100 ns leaves ~2e-05 V
+# of tail, which was invisible while the event itself was landing ~150 ns late and
+# swamping it. Wait long enough for the filter to be done, so what is left measures
+# the event timing and not the filter.
+SETTLE = 500e-9
+# v(in) ramps at 0.5 V/us, and `cross` now steers the timestep onto the crossing
+# (VAMS-2023 5.10.3.1), so what is left is the curvature error of that prediction.
+SAMPLE_TOL = 1e-6
 DRIFT_TOL = 5e-3
 
 rows = []

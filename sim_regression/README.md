@@ -72,18 +72,23 @@ The analyzer checks two independent claims and exits non-zero if either fails:
 Current result:
 
 ```
-worst drift within a hold interval : 7.49e-06 V  (tol 5e-03)
-worst held-vs-sampled error        : 7.50e-05 V  (tol 1e-03)
+worst drift within a hold interval : 0.00e+00 V  (tol 5e-03)
+worst held-vs-sampled error        : 0.00e+00 V  (tol 1e-06)
 PASS: out holds each sampled value between edges -- LRM behaviour
 ```
 
-The 75 uV is not noise, it is the remaining half of issue #37: `cross` detects
-the crossing but does not yet *place* a timestep on it, so the event lands on the
-first accepted step after the crossing and the input has moved on by then (0.5
-V/us times one step). Closing that means driving `bound_step` from the pending
-crossing so the step lands inside the `time_tol` / `expr_tol` box, at which point
-this number should drop by orders of magnitude. It is the natural next
-acceptance criterion — tighten `SAMPLE_TOL` when it does.
+Exact, and the tolerance is a thousand times tighter than it was. `cross` now
+steers the timestep onto the crossing (5.10.3.1: "in addition, cross() controls
+the timestep to accurately resolve the crossing") rather than letting the event
+land on whatever step the solver took next. The previous compiler fails this same
+check at 7.50e-05 V.
+
+One measurement note that cost some confusion: `transition(state, 0, 10n)` is a
+continuous lag, so it approaches the sampled value asymptotically rather than
+arriving in exactly 10 ns. At 100 ns after an edge it is still ~2e-05 V short,
+which was invisible while the event was landing ~150 ns late and swamping it.
+`SETTLE` is 500 ns so that what this test measures is the event timing and not
+the filter.
 
 For the record, the two earlier states of this test, both of which it now
 distinguishes by name:
@@ -129,17 +134,18 @@ rest.
 
 ```
 reading before the first crossing : max -1  (must be negative)
-  crossing 1 at  5.00us : read 4.999999810us   err 1.90e-13 s
-  crossing 2 at 10.00us : read 9.999999810us   err 1.90e-13 s
-  crossing 3 at 15.00us : read 14.999999800us  err 2.00e-13 s
-  crossing 4 at 20.00us : read 19.999999800us  err 2.00e-13 s
+  crossing 1 at  5.00us : read  5.000000000us  err 0.00e+00 s
+  crossing 4 at 20.00us : read 20.000000000us  err 0.00e+00 s
 PASS
 ```
 
-0.2 ps against a 5 us period, from linear interpolation alone. §4.5.10 is
-explicit that the function "does not control the timestep to get accurate
-results", so that is all it is entitled to, and on a signal this smooth it is
-plenty.
+Exact. §4.5.10 is explicit that `last_crossing` itself "does not control the
+timestep to get accurate results" -- on its own it managed 0.2 ps here, from
+linear interpolation alone. What closed the last of it is the `@(cross)` in the
+same model, which now steers the timestep onto the crossing, so the two points
+the interpolation runs between straddle it tightly. The clause says as much:
+last_crossing "can be used with the cross() or above() function for improved
+accuracy".
 
 The model also measures `period` the way 4.5.10's own example does, and that is
 asserted too: 5.000000 us, exactly. It reads `latest` inside the `@(cross)`

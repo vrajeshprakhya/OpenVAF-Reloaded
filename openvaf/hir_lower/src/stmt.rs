@@ -139,9 +139,9 @@ impl BodyLoweringCtx<'_, '_, '_> {
         // no direction, so `enable` sits one place earlier. `timer` schedules on
         // absolute time instead of a crossing and has its own lowering; `absdelta`
         // stays unscheduled.
-        let (dir_arg, enable_arg) = match fun {
-            BuiltIn::cross => (Some(1), 4),
-            BuiltIn::above => (None, 3),
+        let (dir_arg, tol_arg, enable_arg) = match fun {
+            BuiltIn::cross => (Some(1), 2, 4),
+            BuiltIn::above => (None, 1, 3),
             BuiltIn::timer => return self.lower_timer(args),
             _ => return None,
         };
@@ -196,6 +196,13 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let time = self.ctx.use_param(ParamKind::Abstime);
         let advanced = self.ctx.ins().fgt(time, F_ZERO);
 
+        // Ask the solver to put the next point on the crossing. Nothing to steer
+        // without equations (verilogae, the init function), where `$bound_step` has
+        // no simulator to reach.
+        if !self.ctx.no_equations {
+            self.bound_step_to_crossing(args, tol_arg, cur, prev, time);
+        }
+
         // `above` also fires wherever the expression is *already* positive before
         // time has moved, which is 5.10.3.2's whole point: "if the expression is
         // positive at the conclusion of the initial condition analysis that precedes
@@ -242,6 +249,75 @@ impl BodyLoweringCtx<'_, '_, '_> {
             BuiltIn::above => Some(fired),
             _ => unreachable!("only cross and above take part in scheduling"),
         }
+    }
+
+    /// Steer the timestep towards a threshold crossing, so the event lands inside
+    /// the box 5.10.3.1 Figure 5-6 draws around it rather than wherever the solver
+    /// happened to step next. "In addition, cross() controls the timestep to
+    /// accurately resolve the crossing", and 5.10.3.2 says the same of `above`.
+    ///
+    /// Detection alone cannot do this: by the time two accepted points straddle
+    /// zero, the crossing is already behind us, and a model cannot ask for a step to
+    /// be rejected. So this predicts instead. The expression's rate of change over
+    /// the last accepted step extrapolates to the time it reaches zero, and
+    /// `$bound_step` caps the next step there. Overshoot stops being a fraction of
+    /// the solver's step and becomes the curvature error of that extrapolation, and
+    /// since each capped step lands closer the estimate sharpens as it approaches.
+    ///
+    /// `time_tol` is the floor: never propose a step below it, which is both what
+    /// stops the refinement and what "within time_tol of the crossing" buys. With
+    /// none given the tool picks one, as the clause allows -- here a thousandth of
+    /// the step already being taken, which is relative to whatever scale the solver
+    /// is working at and cannot collapse towards zero on its own.
+    fn bound_step_to_crossing(
+        &mut self,
+        args: &[ExprId],
+        tol_arg: usize,
+        cur: Value,
+        prev: Value,
+        now: Value,
+    ) {
+        let state = self.ctx.alloc_retained_state(0.0);
+        let t_prev = self.ctx.retained_prev(state);
+        self.ctx.store_retained(state, now);
+
+        let one = self.ctx.fconst(1.0);
+        let never = self.ctx.fconst(f64::MAX);
+
+        // The step behind us, and the rate over it. Both meaningless before time has
+        // moved, which the `stepping` guard covers; the divisions are evaluated
+        // either way, so their divisors are pinned.
+        let dt = self.ctx.ins().fsub(now, t_prev);
+        let stepping = self.ctx.ins().fgt(dt, F_ZERO);
+        let dt_safe = self.ctx.make_select(stepping, |_s, taken| if taken { dt } else { one });
+        let change = self.ctx.ins().fsub(cur, prev);
+        let rate = self.ctx.ins().fdiv(change, dt_safe);
+
+        let rising = self.ctx.ins().fgt(rate, F_ZERO);
+        let falling = self.ctx.ins().flt(rate, F_ZERO);
+        let moving = self.or(rising, falling);
+        let rate_safe = self.ctx.make_select(moving, |_s, taken| if taken { rate } else { one });
+
+        // Time until the expression reaches zero at this rate. Positive exactly when
+        // it is heading towards the threshold rather than away from it.
+        let neg_cur = self.ctx.ins().fneg(cur);
+        let togo = self.ctx.ins().fdiv(neg_cur, rate_safe);
+        let approaching = self.ctx.ins().fgt(togo, F_ZERO);
+
+        let tol = match args.get(tol_arg) {
+            Some(&tol) if !self.body.is_missing(tol) => self.lower_expr(tol),
+            _ => {
+                let scale = self.ctx.fconst(1e-3);
+                self.ctx.ins().fmul(dt_safe, scale)
+            }
+        };
+        let too_fine = self.ctx.ins().flt(togo, tol);
+        let aim = self.ctx.make_select(too_fine, |_s, taken| if taken { tol } else { togo });
+
+        let usable = self.and(stepping, moving);
+        let usable = self.and(usable, approaching);
+        let bound = self.ctx.make_select(usable, |_s, taken| if taken { aim } else { never });
+        self.bound_step(bound);
     }
     pub(super) fn lower_stmt(&mut self, stmnt: StmtId) {
         // TODO(msrv): let .. else
