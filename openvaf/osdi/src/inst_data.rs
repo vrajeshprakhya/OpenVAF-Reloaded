@@ -217,6 +217,8 @@ pub struct OsdiInstanceData<'ll> {
     /// See the retained-state note at the top of `openvaf/osdi/stdlib.c` for why
     /// these live here rather than in the simulator's OSDI state array.
     pub retained_vals: &'ll llvm_sys::LLVMType,
+    /// What each slot reads back before anything writes to it, in slot order.
+    pub retained_init: Vec<f64>,
     pub num_retained: u32,
 
     // llvm types for dynamic instance data struct fields
@@ -322,7 +324,8 @@ impl<'ll> OsdiInstanceData<'ll> {
             module.init.cache_slots.raw.values().map(|ty| lltype(ty, cx)).collect();
 
         let state_idx = cx.ty_array(cx.ty_int(), module.intern.lim_state.len() as u32);
-        let num_retained = module.intern.num_retained_states;
+        let retained_init: Vec<f64> = module.intern.retained_init.raw.clone();
+        let num_retained = retained_init.len() as u32;
         let retained_vals = cx.ty_array(ty_f64, 2 * num_retained);
         let retained_time = cx.ty_double();
         let static_fields: [_; NUM_CONST_FIELDS as usize] = [
@@ -358,6 +361,7 @@ impl<'ll> OsdiInstanceData<'ll> {
             state_idx,
             collapsed,
             retained_vals,
+            retained_init,
             num_retained,
             params,
             eval_outputs,
@@ -849,10 +853,11 @@ impl<'ll> OsdiInstanceData<'ll> {
         )
     }
 
-    /// Zero the retained slots and the timestamp. The simulator owns this memory and
-    /// makes no promise about its contents, so `setup_instance` establishes the
-    /// initial state: every latch reads as 0 before the first crossing, and a
-    /// timestamp of 0 means the first evaluation at t = 0 commits nothing.
+    /// Establish the initial retained state. The simulator owns this memory and makes
+    /// no promise about its contents, so `setup_instance` writes what each slot should
+    /// read back before anything has written to it -- zero for a latch, negative for
+    /// `last_crossing` -- into both halves of the pair. A timestamp of zero means the
+    /// first evaluation at t = 0 commits nothing.
     pub unsafe fn init_retained(
         &self,
         builder: &mir_llvm::Builder<'_, '_, 'll>,
@@ -862,12 +867,15 @@ impl<'ll> OsdiInstanceData<'ll> {
             return;
         }
         let cx = builder.cx;
-        let zero = cx.const_real(0.0);
-        for i in 0..2 * self.num_retained {
-            let slot = self.retained_elem_ptr(cx, ptr, i, builder.llbuilder);
-            builder.store(slot, zero);
+        for (i, &init) in self.retained_init.iter().enumerate() {
+            let init = cx.const_real(init);
+            let i = i as u32;
+            for half in 0..2 {
+                let slot = self.retained_elem_ptr(cx, ptr, 2 * i + half, builder.llbuilder);
+                builder.store(slot, init);
+            }
         }
-        builder.store(self.retained_time_ptr(ptr, builder.llbuilder), zero);
+        builder.store(self.retained_time_ptr(ptr, builder.llbuilder), cx.const_real(0.0));
     }
 
     /// Pointer to the instance's retained-state timestamp.

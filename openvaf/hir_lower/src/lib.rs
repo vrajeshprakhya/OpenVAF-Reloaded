@@ -291,9 +291,10 @@ pub struct HirInterner {
     pub tagged_reads: IndexMap<Value, Variable, BuildHasherDefault<FxHasher>>,
     pub implicit_equations: TiVec<ImplicitEquation, ImplicitEquationKind>,
     pub lim_state: TiMap<LimitState, Value, Vec<(Value, bool)>>,
-    /// How many retained slots this module allocated. The backend turns each into a
-    /// pair of instance-data fields; see [`RetainedState`].
-    pub num_retained_states: u32,
+    /// The value each retained slot holds before anything has written to it, in slot
+    /// order. The length is the number of slots; the backend turns each into a pair
+    /// of instance-data fields initialized to this value. See [`RetainedState`].
+    pub retained_init: TiVec<RetainedState, f64>,
 }
 
 pub type LiveParams<'a> = FilterMap<
@@ -312,7 +313,7 @@ impl Default for HirInterner {
             tagged_reads: IndexMap::with_hasher(BuildHasherDefault::<FxHasher>::default()),
             implicit_equations: TiVec::default(),
             lim_state: TiMap::default(),
-            num_retained_states: 0,
+            retained_init: TiVec::new(),
         }
     }
 }

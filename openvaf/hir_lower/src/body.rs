@@ -34,7 +34,7 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
                 let (elem_ty, places) = self.retained_layout(var);
                 let mut states = Vec::with_capacity(places.len());
                 for place in places {
-                    let state = self.ctx.alloc_retained_state();
+                    let state = self.ctx.alloc_retained_state(0.0);
                     let init = self.retained_load(state, &elem_ty);
                     self.ctx.def_place(place, init);
                     states.push(state);

@@ -1010,6 +1010,93 @@ impl BodyLoweringCtx<'_, '_, '_> {
                     x
                 }
             }
+            BuiltIn::last_crossing => {
+                // VAMS-2023 4.5.10: the simulation time at which `expr` last crossed
+                // zero, in the requested direction.
+                //
+                //   last_crossing ( expr [ , direction ] )
+                //
+                // "does not control the timestep to get accurate results; it uses
+                // linear interpolation to estimate the time of the last crossing",
+                // so this needs no breakpoint machinery -- only the expression and
+                // the time at the previous accepted timestep, both of which the
+                // retained-state slots already provide.
+                let cur = self.lower_expr(args[0]);
+                if self.ctx.no_equations {
+                    // Nothing steps time here, so nothing can have crossed.
+                    return self.ctx.fconst(-1.0);
+                }
+                let now = self.ctx.use_param(ParamKind::Abstime);
+
+                let s_prev = self.ctx.alloc_retained_state(0.0);
+                let s_time = self.ctx.alloc_retained_state(0.0);
+                // "Before the expression crosses zero (0) for the first time, the
+                // last_crossing() function returns a negative value."
+                let s_last = self.ctx.alloc_retained_state(-1.0);
+
+                let prev = self.ctx.retained_prev(s_prev);
+                let t_prev = self.ctx.retained_prev(s_time);
+                let last = self.ctx.retained_prev(s_last);
+
+                self.ctx.store_retained(s_prev, cur);
+                self.ctx.store_retained(s_time, now);
+
+                let cur_ge = self.ctx.ins().fge(cur, F_ZERO);
+                let cur_le = self.ctx.ins().fle(cur, F_ZERO);
+                let prev_lt = self.ctx.ins().flt(prev, F_ZERO);
+                let prev_gt = self.ctx.ins().fgt(prev, F_ZERO);
+                let rising = self.and(prev_lt, cur_ge);
+                let falling = self.and(prev_gt, cur_le);
+
+                // "If it is set to 0, the last_crossing() will return the most
+                // recent time the input expression had either a rise or falling edge
+                // transition. If direction is +1 (-1), [...] rising (falling)."
+                // Omitted behaves as 0.
+                let crossed = match args.get(1) {
+                    Some(&dir) if !self.body.is_missing(dir) => {
+                        let dir = self.lower_expr(dir);
+                        let zero = self.ctx.iconst(0);
+                        let one = self.ctx.iconst(1);
+                        let minus_one = self.ctx.iconst(-1);
+                        let both = self.ctx.ins().ieq(dir, zero);
+                        let up = self.ctx.ins().ieq(dir, one);
+                        let down = self.ctx.ins().ieq(dir, minus_one);
+                        let want_rising = self.or(up, both);
+                        let want_falling = self.or(down, both);
+                        let up = self.and(want_rising, rising);
+                        let down = self.and(want_falling, falling);
+                        self.or(up, down)
+                    }
+                    _ => self.or(rising, falling),
+                };
+
+                // Two distinct time points are needed to interpolate between, so
+                // nothing is detected until time has moved. This also keeps dc, ac
+                // and noise -- where `$abstime` stands still -- returning the
+                // initial negative value.
+                let advanced = self.ctx.ins().fgt(now, t_prev);
+                let crossed = self.and(crossed, advanced);
+
+                // Linear interpolation between the two straddling points:
+                //   t = t_prev + (now - t_prev) * (0 - prev) / (cur - prev)
+                // A crossing implies `cur != prev`, but the division is evaluated
+                // either way, so pin the denominator to 1 when it is not.
+                let dt = self.ctx.ins().fsub(now, t_prev);
+                let den = self.ctx.ins().fsub(cur, prev);
+                let one = self.ctx.fconst(1.0);
+                let den = self.ctx.make_select(crossed, |_s, taken| if taken { den } else { one });
+                let frac = self.ctx.ins().fdiv(prev, den);
+                let step = self.ctx.ins().fmul(dt, frac);
+                // t_prev + dt * (-prev / den), written as a subtraction to keep the
+                // negation out of the way.
+                let t_cross = self.ctx.ins().fsub(t_prev, step);
+
+                let last = self
+                    .ctx
+                    .make_select(crossed, |_s, taken| if taken { t_cross } else { last });
+                self.ctx.store_retained(s_last, last);
+                last
+            }
             BuiltIn::limit => self.lower_expr(args[0]),
 
             // `ac_stim` is an AC small-signal stimulus: it is defined to be zero in the

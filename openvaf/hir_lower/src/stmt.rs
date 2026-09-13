@@ -11,12 +11,12 @@ use crate::{CallBackKind, CurrentKind, ImplicitEquationKind, ParamKind, PlaceKin
 
 impl BodyLoweringCtx<'_, '_, '_> {
     /// `a && b`, lowered the way `BinaryOp::BooleanAnd` is.
-    fn and(&mut self, a: Value, b: Value) -> Value {
+    pub(crate) fn and(&mut self, a: Value, b: Value) -> Value {
         self.lower_select_with(a, |_| b, |_| FALSE)
     }
 
     /// `a || b`, lowered the way `BinaryOp::BooleanOr` is.
-    fn or(&mut self, a: Value, b: Value) -> Value {
+    pub(crate) fn or(&mut self, a: Value, b: Value) -> Value {
         self.lower_select_with(a, |_| TRUE, |_| b)
     }
 
@@ -65,7 +65,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
         // The previous accepted value of the expression. Stored unconditionally, so
         // the comparison always refers to the last accepted timestep.
-        let state = self.ctx.alloc_retained_state();
+        let state = self.ctx.alloc_retained_state(0.0);
         let prev = self.ctx.retained_prev(state);
         self.ctx.store_retained(state, cur);
 

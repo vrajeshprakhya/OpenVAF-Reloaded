@@ -53,6 +53,7 @@ describes, and says nothing about it. One item was in it; it now warns.
 | Feature | Clause | Status |
 | --- | --- | --- |
 | `$discontinuity(n)`, n >= 0 | 9.17.1 | Still dropped, but **no longer silent**: warns as `ignored_discontinuity` (L019). |
+| Analog variable persistence | 4.5.10, 5.10.2 | **Silently wrong.** A variable read before it is assigned in the same evaluation reads its initial value, not the value it held at the end of the previous evaluation. |
 
 `hir_lower/src/expr.rs` handles only `$discontinuity(-1)`, the form that belongs
 with `$limit` (9.17.3); every other degree lowers to nothing, because OSDI has no
@@ -64,6 +65,35 @@ Actually announcing it still needs the OSDI facility below. Driving `bound_step`
 down across the jump would be a partial answer, but the degree argument carries
 no time, so the cap would have to be invented; that is a policy decision worth
 making deliberately rather than silently.
+
+### Analog variable persistence
+
+Found while implementing `last_crossing`, and it is the sharper of the two. A
+variable assigned inside an event handler does retain across timesteps — that is
+the machinery behind `@(cross)` latches, and it covers 5.10.2's `bitErrorRate`
+example (`errors = errors + 1` inside `@(timer(...))`, verified working). What
+does not work is a variable **read before it is assigned** within one evaluation:
+it reads its initialization value instead of what it held last time.
+
+Three probes, driven by a 200 kHz sine and read in ngspice:
+
+| Pattern | Result |
+| --- | --- |
+| `@(cross(..)) n = n + 1;` — handler reads its own retained value | works: 1, 2, 3, 4 |
+| `x = $abstime;` then `@(cross(..)) y = x;` — read after assignment | works |
+| `@(cross(..)) y = x;` then `x = $abstime;` — read before assignment | **always 0** |
+
+The third is exactly the shape of 4.5.10's own period-measurement example, which
+copies `previous = latest` inside the `@(cross)` handler before `latest =
+last_crossing(...)` runs further down the block. In the LRM's model the analog
+block's variables persist between evaluations, so that read yields the previous
+evaluation's crossing time; here it yields zero and the measured period comes out
+as the absolute crossing time instead. It compiles clean with no diagnostic.
+
+The mechanism to fix it already exists — retained slots with per-slot initial
+values. What is missing is the analysis: granting retention to any variable whose
+read can be reached without a prior write in the same evaluation. Until then this
+belongs in Tier 1, because the answer is wrong and nothing says so.
 
 ## Tier 2 — monitored events
 
@@ -123,7 +153,6 @@ the `UNSUPPORTED` list at `sourcegen/src/hir_builtins.rs:29`.
 | Feature | Clause | What it blocks |
 | --- | --- | --- |
 | `zi_nd`, `zi_np`, `zi_zd`, `zi_zp` | 4.5.12 | Linear discrete-time filters. Sampled-data systems, digital filter models, sigma-delta modulators, any DSP chain. A unity Z-filter is a sample-and-hold with period T. |
-| `last_crossing` | 4.5.10 | Timing measurement: period, frequency, duty cycle, jitter. The LRM's own example for this function is a period meter. |
 | `$random`, `$arandom`, `$dist_*`, `$rdist_*` | 9.13 | Jitter, noise injection, mismatch, Monte-Carlo. |
 | `$table_model` | 9.21 | Data-driven behavioral models from swept or measured data. Not merely unsupported: the name is commented out of the sysfun list (`hir_builtins.rs:207`), so it does not resolve at all. |
 | `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fmonitor`, `$fscanf`, `$fgets`, `$sformat`, `$swrite`, `$sscanf`, `$fseek`, `$ftell`, `$feof`, … | 9.5 | File-driven stimulus and result logging — the normal way a system-level testbench gets vectors in and measurements out. |
@@ -164,7 +193,8 @@ is the right home for that.
 ## Confirmed working
 
 Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
-`absdelay`, `transition`, `slew`, `ddx`, `limexp`, all four `laplace_*` forms
+`absdelay`, `transition`, `slew`, `ddx`, `limexp`, `last_crossing`, all four
+`laplace_*` forms
 (4.5.11), `white_noise` / `flicker_noise` / `ac_stim` / `analysis` (4.6),
 `$limit` (9.17.3), `$bound_step` (9.17.2), named events and `->` (5.10.4),
 `initial_step` / `final_step` (5.10.2), `analog initial` (5.2.1), indirect
@@ -179,17 +209,21 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
    Announcing it for real needs step 5.
 2. ~~**`above`**~~ — done. Rising-only crossing plus the initialization event,
    verified against ngspice in `sim_regression/above_init`.
-3. **`last_crossing`** — retained state plus linear interpolation. 4.5.10
-   explicitly does not control the timestep, so no new infrastructure.
-4. **`timer`** — retained next-event time plus `bound_step`. First real want of
+3. ~~**`last_crossing`**~~ — done. Retained state plus linear interpolation;
+   4.5.10 does not control the timestep, so it needed no new infrastructure.
+   Measures crossings to ~0.2 ps in `sim_regression/last_crossing`.
+4. **Analog variable persistence** — retention for reads that can precede their
+   write. Newly found, silently wrong, and it blocks 4.5.10's own example from
+   giving the right answer even though the function itself is now correct.
+5. **`timer`** — retained next-event time plus `bound_step`. First real want of
    the missing breakpoint facility.
-5. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
-   Unblocks 1 and 4, closes the `cross` tolerance box, and lets the `$abstime`
+6. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
+   Unblocks 1 and 5, closes the `cross` tolerance box, and lets the `$abstime`
    retained-state workaround retire.
-6. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
-   after 4.
-7. **Z-transform filters** — retained state plus T-periodic sampling plus
-   `transition`, so largely a composition of 3, 4 and what already exists.
-8. **`` `default_transition `` / `` `default_discipline ``** — independent,
+7. **`$random` / `$dist_*`** — per-instance seed in instance data; only useful
+   after 5.
+8. **Z-transform filters** — retained state plus T-periodic sampling plus
+   `transition`, so largely a composition of 3, 5 and what already exists.
+9. **`` `default_transition `` / `` `default_discipline ``** — independent,
    small, and immediately visible to model writers.
-9. **`$table_model`, then file I/O** — the two largest self-contained items.
+10. **`$table_model`, then file I/O** — the two largest self-contained items.

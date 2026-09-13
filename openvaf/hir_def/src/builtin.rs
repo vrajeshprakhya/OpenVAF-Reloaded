@@ -191,7 +191,6 @@ impl BuiltIn {
             | BuiltIn::zi_np
             | BuiltIn::zi_zd
             | BuiltIn::zi_zp
-            | BuiltIn::last_crossing
             | BuiltIn::fclose
             | BuiltIn::fopen
             | BuiltIn::fdisplay

@@ -15,6 +15,20 @@ event actually fires are claims about waveforms, so they belong here.
 
 ## Running
 
+All of them at once:
+
+```sh
+PATH=$HOME/ngspice-install/bin:$PATH ./sim_regression/run_all.sh
+```
+
+```
+sample_hold    PASS
+above_init     PASS
+last_crossing  PASS
+```
+
+Or one at a time:
+
 ```sh
 export PATH=$HOME/ngspice-install/bin:$PATH
 
@@ -27,6 +41,11 @@ cd ../above_init
 ../../target/release/openvaf-r above_init.va -o above_init.osdi
 ngspice -b above_init.cir
 python3 ../analyze_above_init.py
+
+cd ../last_crossing
+../../target/release/openvaf-r last_crossing.va -o last_crossing.osdi
+ngspice -b last_crossing.cir
+python3 ../analyze_last_crossing.py
 ```
 
 Each analyzer exits non-zero on failure.
@@ -94,6 +113,37 @@ on the *first Newton iteration* of the initial step and ANALYSIS_TRAN on the
 rest, so the event fired on one iteration and was overwritten by the others, and
 `v(out)` stayed at 0 for the whole run. The flags are not stable within a
 timestep; `$abstime` is. Nothing but a real integrator would have caught that.
+
+## last_crossing — passing
+
+A 200 kHz sine, so the rising zero crossings sit at exactly 0, 5, 10, 15 and
+20 us. The one at t = 0 cannot be detected — interpolation needs a point on each
+side — so the reading should stay negative until 5 us and then step through the
+rest.
+
+```
+reading before the first crossing : max -1  (must be negative)
+  crossing 1 at  5.00us : read 4.999999810us   err 1.90e-13 s
+  crossing 2 at 10.00us : read 9.999999810us   err 1.90e-13 s
+  crossing 3 at 15.00us : read 14.999999800us  err 2.00e-13 s
+  crossing 4 at 20.00us : read 19.999999800us  err 2.00e-13 s
+PASS
+```
+
+0.2 ps against a 5 us period, from linear interpolation alone. §4.5.10 is
+explicit that the function "does not control the timestep to get accurate
+results", so that is all it is entitled to, and on a signal this smooth it is
+plenty.
+
+The model also computes `period` the way 4.5.10's own example does, and the
+analyzer prints it **without asserting on it**: it reads 20 us where it should
+read 5 us. That is not a `last_crossing` defect. The example copies `previous =
+latest` inside the `@(cross)` handler before `latest = last_crossing(...)` runs
+further down the block, so it needs `latest` to still hold the previous
+evaluation's value — and a variable read before it is assigned in an evaluation
+currently reads its initial value instead. See the analog-variable persistence
+section of `docs/lrm-system-level-gaps.md`. The number is printed so it stops
+being wrong visibly, the moment that is fixed.
 
 ## Why retained state does not live in the OSDI state array
 

@@ -688,6 +688,69 @@ fn test_slew() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 4.5.10: `last_crossing` interpolates the zero crossing linearly
+/// between the two straddling points, reports a negative value until the expression
+/// has crossed, and honours the direction argument.
+///
+/// The steps here are a whole microsecond apart with values chosen so the exact
+/// answer is a round number: from -1 to +1 across 1 us crosses at the midpoint.
+/// See `last_crossing.va`; the residual on the branch flow unknown is the reading.
+fn test_last_crossing() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("last_crossing.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+            sim.advance_time(1e-6);
+        }
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("out", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        sim.read_residual("flow(out)").0
+    };
+
+    // "Before the expression crosses zero (0) for the first time, the
+    // last_crossing() function returns a negative value."
+    let lc = step(&instance, &model, &mut sim, -1.0, true);
+    assert!(lc < 0.0, "expected a negative value before the first crossing, got {lc}");
+
+    // t = 1 us, still below zero: nothing has crossed.
+    let lc = step(&instance, &model, &mut sim, -1.0, false);
+    assert!(lc < 0.0, "expected a negative value before the first crossing, got {lc}");
+
+    // t = 2 us at +1, from -1 at t = 1 us: the crossing is exactly halfway.
+    let lc = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, lc, 1.5e-6, epsilon = 1e-15);
+
+    // t = 3 us, no crossing: the reading holds.
+    let lc = step(&instance, &model, &mut sim, 3.0, false);
+    float_cmp::assert_approx_eq!(f64, lc, 1.5e-6, epsilon = 1e-15);
+
+    // t = 4 us, falling through zero. The direction argument is +1, so this is not
+    // a crossing as far as this call is concerned.
+    let lc = step(&instance, &model, &mut sim, -1.0, false);
+    float_cmp::assert_approx_eq!(f64, lc, 1.5e-6, epsilon = 1e-15);
+
+    // t = 5 us at +1, from -1 at t = 4 us: halfway again.
+    let lc = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, lc, 4.5e-6, epsilon = 1e-15);
+
+    Ok(())
+}
+
 /// VAMS-2023 5.10.3.2: `above` also fires during initialization and dc when the
 /// expression is already positive, which is the whole reason it exists -- the LRM's
 /// own wording is that `cross` "would never trigger, even if the voltage on the smpl
@@ -819,5 +882,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing)]
 }

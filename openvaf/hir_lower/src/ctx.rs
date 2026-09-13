@@ -256,11 +256,12 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
 
     /// Allocate a slot that retains a value from one accepted timestep to the next
     /// (the latch state of an `@(cross)` variable, or a monitored expression's
-    /// previous value). The backend gives each slot a pair of instance-data fields.
-    pub fn alloc_retained_state(&mut self) -> RetainedState {
-        let state = RetainedState::from(self.intern.num_retained_states);
-        self.intern.num_retained_states += 1;
-        state
+    /// previous value). The backend gives each slot a pair of instance-data fields,
+    /// both starting at `init` -- which is not always zero: `last_crossing` has to
+    /// read back negative until its expression has actually crossed (VAMS-2023
+    /// 4.5.10).
+    pub fn alloc_retained_state(&mut self, init: f64) -> RetainedState {
+        self.intern.retained_init.push_and_get_key(init)
     }
 
     /// Read the value retained from the previous accepted timestep.
