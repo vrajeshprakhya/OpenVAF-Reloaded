@@ -23,6 +23,7 @@ use crate::body::BodyLoweringCtx;
 use crate::fmt::DisplayKind;
 use crate::{
     CallBackKind, CurrentKind, IdtKind, ImplicitEquationKind, NoiseTable, ParamKind, PlaceKind,
+    RngDist,
     RetFlag,
 };
 
@@ -802,6 +803,38 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 };
                 self.ctx.call1(call, &[val])
             }
+            // VAMS-2023 9.13. `$random`/`$arandom` are an inclusive draw over the
+            // whole 32-bit range; the rest name their distribution. The integer
+            // forms round half away from zero, the `$rdist_*` forms do not.
+            BuiltIn::random | BuiltIn::arandom => {
+                let lo = self.ctx.fconst(-2147483648.0);
+                let hi = self.ctx.fconst(2147483647.0);
+                let val = self.lower_rng(RngDist::UniformInt, args, lo, hi);
+                self.ctx.insert_cast(val, &Type::Real, &Type::Integer)
+            }
+            // `$dist_uniform` is an inclusive draw over the integers in [start, end],
+            // not the real draw rounded -- a different function, not a different
+            // result type.
+            BuiltIn::dist_uniform => self.lower_rng_args(RngDist::UniformInt, args, false),
+            BuiltIn::rdist_uniform => self.lower_rng_args(RngDist::Uniform, args, false),
+            BuiltIn::dist_normal | BuiltIn::rdist_normal => {
+                self.lower_rng_args(RngDist::Normal, args, builtin == BuiltIn::dist_normal)
+            }
+            BuiltIn::dist_erlang | BuiltIn::rdist_erlang => {
+                self.lower_rng_args(RngDist::Erlang, args, builtin == BuiltIn::dist_erlang)
+            }
+            BuiltIn::dist_exponential | BuiltIn::rdist_exponential => {
+                self.lower_rng_args(RngDist::Exponential, args, builtin == BuiltIn::dist_exponential)
+            }
+            BuiltIn::dist_poisson | BuiltIn::rdist_poisson => {
+                self.lower_rng_args(RngDist::Poisson, args, builtin == BuiltIn::dist_poisson)
+            }
+            BuiltIn::dist_chi_square | BuiltIn::rdist_chi_square => {
+                self.lower_rng_args(RngDist::ChiSquare, args, builtin == BuiltIn::dist_chi_square)
+            }
+            BuiltIn::dist_t | BuiltIn::rdist_t => {
+                self.lower_rng_args(RngDist::T, args, builtin == BuiltIn::dist_t)
+            }
             BuiltIn::temperature => self.ctx.use_param(ParamKind::Temperature),
             BuiltIn::simparam => {
                 let arg0 = self.lower_expr(args[0]);
@@ -1096,6 +1129,114 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
             _ => unreachable!(),
         }
+    }
+
+    /// A distribution call whose parameters follow the seed: `f(seed, a [, b])`,
+    /// with an optional trailing `"global"`/`"instance"` string this does not need.
+    /// `round` picks the integer form, which rounds half away from zero.
+    fn lower_rng_args(&mut self, dist: RngDist, args: &[ExprId], round: bool) -> Value {
+        let real = |this: &mut Self, i: usize| match args.get(i) {
+            Some(&arg) if !this.body.is_missing(arg) => {
+                let ty = this.body.expr_type(arg);
+                let val = this.lower_expr(arg);
+                match ty {
+                    Type::Real => val,
+                    ref other => this.ctx.insert_cast(val, other, &Type::Real),
+                }
+            }
+            _ => F_ZERO,
+        };
+        let a = real(self, 1);
+        let b = real(self, 2);
+        let val = self.lower_rng(dist, args, a, b);
+        if round {
+            // The `$dist_*` forms are specified to round half away from zero rather
+            // than truncate. The result stays a real -- that is what these are
+            // declared to return in the analog context (DIST_*_ARG -> Real); only
+            // `$random` hands back an integer.
+            let half = self.ctx.fconst(0.5);
+            let negative = self.ctx.ins().flt(val, F_ZERO);
+            let up = self.ctx.ins().fadd(val, half);
+            let down = self.ctx.ins().fsub(val, half);
+            let rounded = self.ctx.make_select(negative, |_s, taken| if taken { down } else { up });
+            // `fitrunc`, not a real-to-integer cast: that cast rounds, and rounding
+            // a value that has already had the half added lands one out.
+            let as_int = self.ctx.ins().fitrunc(rounded);
+            self.ctx.insert_cast(as_int, &Type::Integer, &Type::Real)
+        } else {
+            val
+        }
+    }
+
+    /// Draw from `dist`, and leave the seed where the draw left it.
+    ///
+    /// 9.13.1: "If the random_seed argument is specified it is an inout argument;
+    /// that is, a value is passed to the function and a different value is
+    /// returned." When it names a variable that is what happens, and the variable
+    /// keeps its value between evaluations because a read that precedes its write
+    /// earns retention -- which is also what makes this converge: every Newton
+    /// iteration of one timestep reads the same committed seed and so draws the
+    /// same number, and only the accepted step advances it.
+    ///
+    /// A seed that is a parameter, a constant or absent gets a retained slot of its
+    /// own instead, seeded from the expression on the first evaluation, per "an
+    /// internal seed is created which is assigned the initial value".
+    fn lower_rng(&mut self, dist: RngDist, args: &[ExprId], a: Value, b: Value) -> Value {
+        let seed_var = args.first().and_then(|&arg| {
+            if self.body.is_missing(arg) {
+                return None;
+            }
+            match self.body.try_get_expr(arg) {
+                Some(Expr::Read(Ref::Variable(var))) => Some(var),
+                _ => None,
+            }
+        });
+
+        // `Some(slot)` when the seed has nowhere of its own to live and needs a
+        // retained slot instead of a variable to be written back to.
+        let (seed, slot) = match seed_var {
+            Some(var) => {
+                let seed = self.ctx.use_place(PlaceKind::Var(var));
+                (self.ctx.insert_cast(seed, &Type::Integer, &Type::Real), None)
+            }
+            None => {
+                // Whatever the call names, taken once: a parameter, a constant, or
+                // an arbitrary starting point when the seed was left out entirely.
+                let initial = match args.first() {
+                    Some(&arg) if !self.body.is_missing(arg) => {
+                        let ty = self.body.expr_type(arg);
+                        let val = self.lower_expr(arg);
+                        match ty {
+                            Type::Real => val,
+                            ref other => self.ctx.insert_cast(val, other, &Type::Real),
+                        }
+                    }
+                    _ => self.ctx.fconst(259341593.0),
+                };
+                let slot = self.ctx.alloc_retained_state(0.0);
+                let carried = self.ctx.retained_prev(slot);
+                let first = self.ctx.first_eval();
+                let seed = self
+                    .ctx
+                    .make_select(first, |_s, taken| if taken { initial } else { carried });
+                (seed, Some(slot))
+            }
+        };
+
+        let call_args = [seed, a, b];
+        let value = self.ctx.call1(CallBackKind::RngValue(dist), &call_args);
+        let next = self.ctx.call1(CallBackKind::RngSeed(dist), &call_args);
+
+        match (seed_var, slot) {
+            (Some(var), _) => {
+                let next = self.ctx.insert_cast(next, &Type::Real, &Type::Integer);
+                self.ctx.def_place(PlaceKind::Var(var), next);
+            }
+            (None, Some(slot)) => self.ctx.store_retained(slot, next),
+            _ => {}
+        }
+
+        value
     }
 
     fn lower_integral(&mut self, kind: IdtKind, args: &[ExprId]) -> Value {
