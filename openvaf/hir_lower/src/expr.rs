@@ -1131,19 +1131,33 @@ impl BodyLoweringCtx<'_, '_, '_> {
         }
     }
 
+    /// Lower `arg` and hand back a real, whatever it was written as.
+    ///
+    /// The type to cast from is the one `lower_expr` leaves behind, which is not
+    /// always `expr_type`: `lower_expr` finishes by applying the coercion the
+    /// resolved signature asked for, so an argument written as an integer literal
+    /// in a `Val(Real)` parameter -- `$rdist_normal(seed, 0, 1)`, the form the LRM
+    /// examples use -- is already real by the time it gets here. Casting it again
+    /// from `expr_type` emits an int-to-real cast over a value that is real
+    /// already, and constant propagation rejects that pairing outright.
+    fn lower_expr_as_real(&mut self, arg: ExprId) -> Value {
+        let ty = match self.body.needs_cast(arg) {
+            Some((_, dst)) => dst.clone(),
+            None => self.body.expr_type(arg),
+        };
+        let val = self.lower_expr(arg);
+        match ty {
+            Type::Real => val,
+            ref other => self.ctx.insert_cast(val, other, &Type::Real),
+        }
+    }
+
     /// A distribution call whose parameters follow the seed: `f(seed, a [, b])`,
     /// with an optional trailing `"global"`/`"instance"` string this does not need.
     /// `round` picks the integer form, which rounds half away from zero.
     fn lower_rng_args(&mut self, dist: RngDist, args: &[ExprId], round: bool) -> Value {
         let real = |this: &mut Self, i: usize| match args.get(i) {
-            Some(&arg) if !this.body.is_missing(arg) => {
-                let ty = this.body.expr_type(arg);
-                let val = this.lower_expr(arg);
-                match ty {
-                    Type::Real => val,
-                    ref other => this.ctx.insert_cast(val, other, &Type::Real),
-                }
-            }
+            Some(&arg) if !this.body.is_missing(arg) => this.lower_expr_as_real(arg),
             _ => F_ZERO,
         };
         let a = real(self, 1);
@@ -1203,14 +1217,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 // Whatever the call names, taken once: a parameter, a constant, or
                 // an arbitrary starting point when the seed was left out entirely.
                 let initial = match args.first() {
-                    Some(&arg) if !self.body.is_missing(arg) => {
-                        let ty = self.body.expr_type(arg);
-                        let val = self.lower_expr(arg);
-                        match ty {
-                            Type::Real => val,
-                            ref other => self.ctx.insert_cast(val, other, &Type::Real),
-                        }
-                    }
+                    Some(&arg) if !self.body.is_missing(arg) => self.lower_expr_as_real(arg),
                     _ => self.ctx.fconst(259341593.0),
                 };
                 let slot = self.ctx.alloc_retained_state(0.0);
