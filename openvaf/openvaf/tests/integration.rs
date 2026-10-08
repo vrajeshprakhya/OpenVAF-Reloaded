@@ -820,6 +820,93 @@ fn test_rng_stream() -> Result<()> {
         }
     }
 
+    // The `$rdist_*` forms, written with integer literals in `Val(Real)`
+    // parameters -- the spelling the LRM examples use, and the one that used to
+    // reach constant propagation with an int-to-real cast over an already-real
+    // value and abort the compiler.
+    //
+    // They get no reference values of their own on purpose. Each draws the same
+    // number as the `$dist_*` kind seven below it and leaves it unrounded, so the
+    // table above is the ground truth for these too: round half away from zero,
+    // which is what 9.13.1 asks the integer forms to do, and the two must agree
+    // on the value and on the seed they leave behind. A number this test made up
+    // itself would prove nothing about either.
+    let round_half_away = |x: f64| if x < 0.0 { (x - 0.5).trunc() } else { (x + 0.5).trunc() };
+
+    for &(kind, seed0, expected) in &cases[2..] {
+        let rkind = kind + 7.0;
+        let desc = test_descriptor(&openvaf_test_data("osdi").join("rng_stream.va"))?;
+        let model = desc.new_model();
+        model.set_real_param(1, seed0);
+        model.set_real_param(2, rkind);
+        model.process_params()?;
+        let mut instance = model.new_instance();
+        let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+        for (step, &(want_val, want_seed)) in expected.iter().enumerate() {
+            if step != 0 {
+                sim.next_iter();
+                sim.advance_time(1e-6);
+            }
+            sim.set_voltage("in", 0.0);
+            sim.set_voltage("val", 0.0);
+            sim.set_voltage("seed_out", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+
+            let got_val = sim.read_residual("flow(val)").0;
+            let got_seed = sim.read_residual("flow(seed_out)").0;
+            assert!(
+                (round_half_away(got_val) - want_val).abs() < 1e-6,
+                "kind {rkind} draw {step}: {got_val} rounds to {}, but kind {kind} drew {want_val}",
+                round_half_away(got_val)
+            );
+            assert!(
+                (got_seed - want_seed).abs() < 1e-6,
+                "kind {rkind} draw {step}: seed {got_seed}, want {want_seed}"
+            );
+        }
+    }
+
+    // `$rdist_uniform` has no integer partner to check against: `$dist_uniform`
+    // draws over the integers in the interval rather than rounding this one. All
+    // that is asserted is that it compiles, draws inside the interval it was
+    // given, and moves its seed -- enough to catch the crash, which is what this
+    // arm is here for.
+    {
+        let desc = test_descriptor(&openvaf_test_data("osdi").join("rng_stream.va"))?;
+        let model = desc.new_model();
+        model.set_real_param(1, 12345.0);
+        model.set_real_param(2, 8.0);
+        model.process_params()?;
+        let mut instance = model.new_instance();
+        let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+        let mut seeds = Vec::new();
+        for step in 0..4 {
+            if step != 0 {
+                sim.next_iter();
+                sim.advance_time(1e-6);
+            }
+            sim.set_voltage("in", 0.0);
+            sim.set_voltage("val", 0.0);
+            sim.set_voltage("seed_out", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+
+            let got_val = sim.read_residual("flow(val)").0;
+            assert!(
+                (0.0..=100.0).contains(&got_val),
+                "kind 8 draw {step}: {got_val} is outside the interval 0..100 it was given"
+            );
+            seeds.push(sim.read_residual("flow(seed_out)").0);
+        }
+        assert!(
+            seeds.windows(2).any(|w| w[0] != w[1]),
+            "kind 8: the seed never moved across four accepted steps: {seeds:?}"
+        );
+    }
+
     Ok(())
 }
 
