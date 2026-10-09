@@ -26,6 +26,7 @@ sample_hold    PASS
 above_init     PASS
 last_crossing  PASS
 timer          PASS
+transition     PASS
 ```
 
 Or one at a time:
@@ -52,6 +53,11 @@ cd ../timer
 ../../target/release/openvaf-r timer.va -o timer.osdi
 ngspice -b timer.cir
 python3 ../analyze_timer.py
+
+cd ../transition
+../../target/release/openvaf-r trfilter.va -o trfilter.osdi
+ngspice -b trfilter.cir
+python3 ../analyze_transition.py
 ```
 
 Each analyzer exits non-zero on failure.
@@ -171,6 +177,42 @@ total events fired     : 5  (want 5)
 
 The tick count is the part that would catch a subtler bug than "no event": one
 event per period, not one per Newton iteration of the step it lands on.
+
+## transition — passing
+
+`transition` used to be a first-order lag with the rise time as its time
+constant. It never arrived, and it discarded `td` (issue #42). VAMS-2023 4.5.8
+asks for a piecewise linear waveform, delayed by `td`, with "time-points at both
+corners of a transition" — and corners are a claim about a waveform, so the test
+lives here.
+
+Both channels are driven from `timer` events, so every corner sits at an instant
+arithmetic predicts. With `td = 2n`, `tr = 3n`, `tf = 1n`:
+
+```
+corners placed as exact timepoints:
+   12.00 ns : yes    15.00 ns : yes    32.00 ns : yes    33.00 ns : yes
+value at each corner:
+   12.00 ns : 0.000000000  want 0.0  ok
+   15.00 ns : 1.000000000  want 1.0  ok
+samples inside each ramp sit on the straight line:
+       12 -> 15 ns :  13 samples, worst |err| 1.233e-08 (tol 3.333e-08)  ok
+a pulse shorter than td and tr survives as a partial swing:
+  peak              : 0.333333333  want 0.333333333  ok
+  returns to 0      : 53.333333 ns  want 53.333333 ns  ok
+```
+
+The interesting line is the last block. A 1 ns pulse is shorter than the 2 ns
+delay, so an inertial reading of `td` would swallow it; 4.5.8 says `td` "models
+transport delay" and allows "an arbitrary number of transitions pending", so both
+edges have to come back out. It is also shorter than `tr`, so it only climbs a
+third of the way, and the interrupted fall is computed from the old destination as
+origin — which makes it take `tf/3`, landing at 53.333 ns rather than the 54 ns a
+fall from the current value over `tf` would give.
+
+The linearity tolerance is derived from the printed time resolution rather than
+fixed: `wrdata` gives the time column 9 significant digits, and on the 1 ns fall
+that uncertainty already shows up in the value at the 1e-7 level.
 
 ## Why retained state does not live in the OSDI state array
 

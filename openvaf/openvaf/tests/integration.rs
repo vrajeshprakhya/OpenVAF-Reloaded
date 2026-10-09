@@ -1001,6 +1001,129 @@ fn test_cross_detect() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 4.5.8: `transition` is a piecewise linear waveform, delayed by `td`.
+///
+/// The clause pins three things a first-order lag could not do, and this test pins
+/// each of them against arithmetic (see `transition_pwl.va`, where time is in
+/// seconds and one `step` is one accepted timestep of 1 s):
+///
+///   * the ramp is straight and *arrives*, at exactly `rise_time` after it starts,
+///     rather than approaching the destination asymptotically;
+///   * `td` is a transport delay, so the transition starts `td` after the change;
+///   * an interrupted transition takes "the slope which completes the transition
+///     from the origin (not the current value) in the specified transition time",
+///     with the origin being the old destination when the new destination is below
+///     the current value and the *first* origin when it is above. Both arms are
+///     covered, and both are distinguishable from the naive reading that would ramp
+///     from the current value over the full transition time.
+fn test_transition_pwl() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    const TR: f64 = 4.0;
+    const TF: f64 = 2.0;
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("transition_pwl.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // One accepted timestep: commit the previous state, advance time by 1 s, apply
+    // the input, evaluate. Returns (delayed, undelayed) outputs.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+        }
+        sim.advance_time(1.0);
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("out", 0.0);
+        sim.set_voltage("fast", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        (sim.read_residual("flow(out)").0, sim.read_residual("flow(fast)").0)
+    };
+
+    // t = 1, the first evaluation. 4.5.8: "In DC analysis, transition() passes the
+    // value of the expr directly to its output", and there is no history yet.
+    let (out, fast) = step(&instance, &model, &mut sim, 0.0, true);
+    float_cmp::assert_approx_eq!(f64, out, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, fast, 0.0, epsilon = 1e-9);
+
+    // -- the transport delay, then a straight ramp that arrives -----------------
+    // t = 2: the input steps to 1. `out` schedules a transition for t = 4 and must
+    // not move before then; `fast` starts climbing immediately.
+    let (out, fast) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, out, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, fast, 0.0, epsilon = 1e-9);
+    // t = 3: still inside the delay window.
+    let (out, fast) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, out, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, fast, 1.0 / TR, epsilon = 1e-9);
+    // t = 4: td has elapsed, so the ramp starts here -- still at 0.
+    let (out, _) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, out, 0.0, epsilon = 1e-9);
+    // t = 5..8: 1/TR per second, arriving at exactly 1.0 at t = 8, which is TR
+    // after the ramp started. The first-order lag read 0.221, 0.393, 0.528 and
+    // 0.632 at these four points and never reached 1.0 at all.
+    for n in 1..=4 {
+        let (out, _) = step(&instance, &model, &mut sim, 1.0, false);
+        float_cmp::assert_approx_eq!(f64, out, f64::from(n) / TR, epsilon = 1e-9);
+    }
+    // t = 9: clamped at the destination, not creeping towards it.
+    let (out, fast) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, out, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, fast, 1.0, epsilon = 1e-9);
+
+    // -- bring `fast` back to 0 so the interrupt cases start from rest ----------
+    // t = 10: starts falling from 1.0 at -1/TF, arriving at t = 12.
+    for want in [1.0, 1.0 - 1.0 / TF, 0.0] {
+        let (_, fast) = step(&instance, &model, &mut sim, 0.0, false);
+        float_cmp::assert_approx_eq!(f64, fast, want, epsilon = 1e-9);
+    }
+
+    // -- interrupted by a lower destination: the old destination is the origin --
+    // t = 13, 14, 15: rise from 0 towards 1 at 1/TR per second.
+    for want in [0.0, 1.0 / TR, 2.0 / TR] {
+        let (_, fast) = step(&instance, &model, &mut sim, 1.0, false);
+        float_cmp::assert_approx_eq!(f64, fast, want, epsilon = 1e-9);
+    }
+    // t = 16: the ramp is at 3/TR = 0.75 and the input drops to 0. That is the value
+    // "at the point of the interruption", and the output is continuous through it.
+    //
+    // The new destination is below it, so the origin becomes the old destination
+    // (1.0) and the slope is the full -1/TF: the 0.75 that was climbed unwinds in
+    // 0.75*TF = 1.5 s. The naive reading -- a fresh transition from the current
+    // value over TF, slope -0.375 -- would read 0.375 at t = 17 instead of 0.25.
+    for want in [3.0 / TR, 3.0 / TR - 1.0 / TF, 0.0] {
+        let (_, fast) = step(&instance, &model, &mut sim, 0.0, false);
+        float_cmp::assert_approx_eq!(f64, fast, want, epsilon = 1e-9);
+    }
+
+    // -- interrupted by a higher destination: the first origin is retained ------
+    // t = 19, 20, 21: rise from 0 towards 1 again.
+    for want in [0.0, 1.0 / TR, 2.0 / TR] {
+        let (_, fast) = step(&instance, &model, &mut sim, 1.0, false);
+        float_cmp::assert_approx_eq!(f64, fast, want, epsilon = 1e-9);
+    }
+    // t = 22: at 0.75 again, the input steps to 2 -- above the current value, so the
+    // *first* origin (0) is retained and the slope is 2/TR = 0.5 per second. The
+    // ramp carries on from 0.75 and arrives at 2.0 at t = 25. A fresh transition
+    // from the current value over TR would climb at (2 - 0.75)/TR = 0.3125 and read
+    // 1.0625 at t = 23 instead of 1.25.
+    for want in [3.0 / TR, 3.0 / TR + 2.0 / TR, 3.0 / TR + 4.0 / TR, 2.0, 2.0] {
+        let (_, fast) = step(&instance, &model, &mut sim, 2.0, false);
+        float_cmp::assert_approx_eq!(f64, fast, want, epsilon = 1e-9);
+    }
+
+    Ok(())
+}
+
 harness! {
     // TODO: run this in CI, somehow this test is flakey tough regarding the linker invocation (and really slow)
     Test::from_dir("integration", &integration_test, &ignore_dev_tests, &project_root().join("integration_tests")),
@@ -1010,5 +1133,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("transition_pwl", &test_transition_pwl)]
 }

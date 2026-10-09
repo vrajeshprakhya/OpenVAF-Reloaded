@@ -920,36 +920,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
                     // No DAE context (AC/noise setup, op-vars): pass the target through.
                     target
                 } else {
-                    // Continuous (slew-limited) realization. The ideal `transition` is a
-                    // piecewise-linear ramp from the old value to the new one over the
-                    // rise/fall time; emitting it as an instantaneous jump produces a
-                    // time discontinuity the transient integrator cannot step across
-                    // ("timestep too small"). We realize it as a first-order lag whose
-                    // time constant is the rise time when the target is increasing and
-                    // the fall time when decreasing — a continuous output the solver
-                    // integrates through, with the requested transition speed.
-                    //
-                    // `transition(expr, td, rise_time, fall_time, time_tol)`: the
-                    // delay and the (dynamic, VAMS-2023 Table 4-20) `time_tol` do not
-                    // affect this continuous realization and are ignored - `time_tol`
-                    // bounds how precisely a simulator places the time point of the
-                    // transition, which a lag has no notion of.
-                    let eps = self.ctx.fconst(1e-12);
-                    let rise = if args.len() > 2 { self.lower_expr(args[2]) } else { eps };
-                    let fall = if args.len() > 3 { self.lower_expr(args[3]) } else { rise };
-                    let (eq, x) =
-                        self.ctx.implicit_equation(ImplicitEquationKind::Idt(IdtKind::Basic));
-                    // tau = (target >= x) ? rise : fall, floored to eps to avoid /0.
-                    let rising = self.ctx.ins().fge(target, x);
-                    let tau = self.ctx.make_select(rising, |_s, b| if b { rise } else { fall });
-                    let tau_ok = self.ctx.ins().fge(tau, eps);
-                    let tau = self.ctx.make_select(tau_ok, |_s, b| if b { tau } else { eps });
-                    // dx/dt = (target - x)/tau  ->  react = x, resist = (x - target)/tau.
-                    let diff = self.ctx.ins().fsub(x, target);
-                    let resist = self.ctx.ins().fdiv(diff, tau);
-                    self.ctx.def_resist_residual(resist, eq);
-                    self.ctx.def_react_residual(x, eq);
-                    x
+                    self.lower_transition(target, args)
                 }
             }
             BuiltIn::slew => {
@@ -1096,6 +1067,328 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
             _ => unreachable!(),
         }
+    }
+
+    /// An optional analog-operator argument. Absent and written as a null argument
+    /// (`transition(x, , 1n)`) are the same thing: the clause's default applies.
+    fn opt_arg(&mut self, args: &[ExprId], idx: usize) -> Option<Value> {
+        match args.get(idx) {
+            Some(&arg) if !self.body.is_missing(arg) => Some(self.lower_expr(arg)),
+            _ => None,
+        }
+    }
+
+    /// `min(a, b)` on reals. The MIR has no intrinsic for it.
+    fn fmin(&mut self, a: Value, b: Value) -> Value {
+        let lt = self.ctx.ins().flt(a, b);
+        self.ctx.make_select(lt, |_s, t| if t { a } else { b })
+    }
+
+    /// `max(a, b)` on reals.
+    fn fmax(&mut self, a: Value, b: Value) -> Value {
+        let gt = self.ctx.ins().fgt(a, b);
+        self.ctx.make_select(gt, |_s, t| if t { a } else { b })
+    }
+
+    /// VAMS-2023 4.5.8: the piecewise-linear realization of
+    ///
+    ///   transition ( expr [ , td [ , rise_time [ , fall_time [ , time_tol ] ] ] ] )
+    ///
+    /// `expr` is expected to evaluate to a piecewise constant waveform. Each change
+    /// of it schedules a transition `td` later, which then ramps linearly to the new
+    /// value, taking `rise_time` upwards and `fall_time` downwards: "td models
+    /// transport delay and rise_time and fall_time model inertial delay". The clause
+    /// is explicit that the result "describes a piecewise linear function over time".
+    ///
+    /// This used to be a first-order lag with the rise time as its time constant,
+    /// which left the output 1/e short at the instant the ramp should have arrived,
+    /// never arrived at all, and dropped `td` on the floor (issue #42). A lag is the
+    /// easier continuous function to write as a DAE residual, but it is not this
+    /// operator: a model transitioning a logic level into a charge pump got the wrong
+    /// charge per pulse out of it, and no `td` could give it a propagation delay.
+    ///
+    /// The ramp needs no unknown of its own. It is an explicit function of `$abstime`
+    /// and of state carried from one accepted timestep to the next, so there is no
+    /// equation here any more and no Jacobian entry to go with it.
+    ///
+    /// # Transport delay
+    ///
+    /// `td` is a transport delay, not an inertial one, so a change arriving while an
+    /// earlier one is still inside the delay window must not cancel it: 4.5.8 says a
+    /// transition function "can have an arbitrary number of transitions pending" and
+    /// that this "can be used to implement transport delay for discrete-valued
+    /// signals". Pending transitions therefore sit in a queue, earliest first, and
+    /// one is taken per evaluation.
+    ///
+    /// A fixed lowering cannot offer an arbitrary number of slots, so `PENDING` is
+    /// the bound. It is reached only when `expr` changes more than that many times
+    /// within one `td`; past it the newest two changes coalesce, which keeps the
+    /// value the output eventually reaches correct and loses a glitch. The other half
+    /// of the clause, "deleting any transitions which would follow a newly scheduled
+    /// transition", is implemented too, and is reachable only when `td` shrinks
+    /// during the simulation -- with a constant delay a new transition is always
+    /// scheduled after the pending ones.
+    ///
+    /// # Interrupted transitions
+    ///
+    /// When a transition starts while another is still in flight, 4.5.8 does not ramp
+    /// from the current value at the current slope. It "computes the slope which
+    /// completes the transition from the origin (not the current value) in the
+    /// specified transition time", where the origin is the old destination if the new
+    /// destination is below the current value, and the *first* origin if it is above.
+    /// The ramp then runs from the current value at that slope, so an interrupted
+    /// transition finishes early rather than taking the full time again. That is what
+    /// turns a pulse shorter than `rise_time` into a reduced-amplitude glitch instead
+    /// of a full-swing one, which is the behaviour a phase detector depends on.
+    ///
+    /// # Timepoints
+    ///
+    /// "The transition function causes the simulator to place time-points at both
+    /// corners of a transition", so `$bound_step` is capped at the distance to each
+    /// pending start instant and to the arrival of the ramp in progress. The trailing
+    /// corner is deliberately *not* requested when the transition time is the
+    /// negligible default, which is the clause's own exemption: forcing it "would
+    /// result in poor performance".
+    ///
+    /// That is also why `time_tol` is accepted and then not used. It asks for a point
+    /// within `time_tol` of a corner, and landing on the corner exactly satisfies any
+    /// tolerance -- the same reasoning `timer` is lowered with.
+    ///
+    /// What stays step-dependent is *when a change is noticed*: `expr` steps, so
+    /// there is no crossing to interpolate. In practice the change is driven by a
+    /// `cross` or `timer` event in the same module, and those already steer the
+    /// solver onto the instant it happens.
+    fn lower_transition(&mut self, target: Value, args: &[ExprId]) -> Value {
+        // 4.5.8: with `rise_time`/`fall_time` unspecified or zero they "default to the
+        // value defined by `default_transition"; without that directive -- which this
+        // compiler does not implement -- "a negligible, but non-zero, transition time
+        // is used", because "forcing a zero-duration transition is undesirable" for
+        // convergence. This is that negligible time, and the floor the lag
+        // realization used as its time constant, so a bare `transition(x)` keeps its
+        // character.
+        const MIN_RAMP: f64 = 1e-12;
+        // How many transitions may be in flight through `td` at once. Each slot costs
+        // two retained values.
+        const PENDING: usize = 4;
+        // An empty queue slot: a time no simulation reaches, kept far enough below
+        // `f64::MAX` that `NEVER + td` is still finite.
+        const NEVER: f64 = 1e300;
+
+        let now = self.ctx.use_param(ParamKind::Abstime);
+
+        let td = self.opt_arg(args, 1).unwrap_or(F_ZERO);
+        let rise = self.opt_arg(args, 2).unwrap_or(F_ZERO);
+        // "If only a positive rise_time value is specified, the simulator uses it for
+        // both rise and fall times."
+        let fall = self.opt_arg(args, 3).unwrap_or(rise);
+        let min_ramp = self.ctx.fconst(MIN_RAMP);
+        let rise = self.fmax(rise, min_ramp);
+        let fall = self.fmax(fall, min_ramp);
+
+        let one = self.ctx.fconst(1.0);
+        let unset = self.ctx.fconst(NEVER);
+        // Half the marker, so a slot reads as empty however `NEVER` was arrived at.
+        let unset_test = self.ctx.fconst(NEVER / 2.0);
+        // `$bound_step`'s "no opinion", matching how `timer` spells it.
+        let no_bound = self.ctx.fconst(f64::MAX);
+
+        // -- state ------------------------------------------------------------
+        // The input value last seen, so a change can be detected.
+        let s_tgt = self.ctx.alloc_retained_state(0.0);
+        // Transitions scheduled but not yet started, earliest first.
+        let mut queue = Vec::with_capacity(PENDING);
+        for _ in 0..PENDING {
+            let at = self.ctx.alloc_retained_state(NEVER);
+            let to = self.ctx.alloc_retained_state(0.0);
+            queue.push((at, to));
+        }
+        // The transition in progress: when it started and from what value, where it
+        // is going, the origin its slope was computed from, that slope, and the
+        // transition time the slope was computed over.
+        let s_t0 = self.ctx.alloc_retained_state(0.0);
+        let s_v0 = self.ctx.alloc_retained_state(0.0);
+        let s_dest = self.ctx.alloc_retained_state(0.0);
+        let s_origin = self.ctx.alloc_retained_state(0.0);
+        let s_slope = self.ctx.alloc_retained_state(0.0);
+        let s_span = self.ctx.alloc_retained_state(0.0);
+
+        let tgt_prev = self.ctx.retained_prev(s_tgt);
+        let mut at_prev = Vec::with_capacity(PENDING);
+        let mut to_prev = Vec::with_capacity(PENDING);
+        for k in 0..PENDING {
+            at_prev.push(self.ctx.retained_prev(queue[k].0));
+            to_prev.push(self.ctx.retained_prev(queue[k].1));
+        }
+        let t0 = self.ctx.retained_prev(s_t0);
+        let v0 = self.ctx.retained_prev(s_v0);
+        let dest = self.ctx.retained_prev(s_dest);
+        let origin = self.ctx.retained_prev(s_origin);
+        let slope = self.ctx.retained_prev(s_slope);
+
+        // -- where the transition in progress has got to ----------------------
+        // A line from `v0` at `t0` at `slope`, clamped to the interval it travels.
+        // The clamp also covers `now < t0`, where the line runs backwards away from
+        // `dest` and is pinned at `v0`.
+        let elapsed = self.ctx.ins().fsub(now, t0);
+        let travelled = self.ctx.ins().fmul(slope, elapsed);
+        let raw = self.ctx.ins().fadd(v0, travelled);
+        let lo = self.fmin(v0, dest);
+        let hi = self.fmax(v0, dest);
+        let cur = self.fmax(raw, lo);
+        let cur = self.fmin(cur, hi);
+
+        // 4.5.8: "In DC analysis, transition() passes the value of the expr directly
+        // to its output", and the first point of a transient has no history to ramp
+        // from either. Retained state commits only once time moves, so this reads
+        // true for every point of a dc sweep and for the operating point, and false
+        // from the first accepted transient step onwards.
+        let first = self.ctx.first_eval();
+        let cur = self.ctx.make_select(first, |_s, b| if b { target } else { cur });
+
+        // -- schedule a transition for each change of the input ---------------
+        // `expr` is piecewise constant, so an exact comparison is the change test:
+        // there is no tolerance to apply to a signal that steps.
+        let changed = self.ctx.ins().fne(target, tgt_prev);
+        let changed = self.lower_select_with(first, |_| FALSE, |_| changed);
+        let starts = self.ctx.ins().fadd(now, td);
+
+        // "deleting any transitions which would follow a newly scheduled transition"
+        let mut kept_at = Vec::with_capacity(PENDING);
+        for k in 0..PENDING {
+            let at = at_prev[k];
+            let after = self.ctx.ins().fge(at, starts);
+            let drop = self.and(changed, after);
+            kept_at.push(self.ctx.make_select(drop, |_s, b| if b { unset } else { at }));
+        }
+
+        // Push into the first slot that is free. The last slot also catches a push
+        // that found none, so the queue degrades by coalescing its newest two
+        // entries rather than by dropping the change and losing the final value.
+        let mut empty = Vec::with_capacity(PENDING);
+        for k in 0..PENDING {
+            empty.push(self.ctx.ins().fge(kept_at[k], unset_test));
+        }
+        let mut push = Vec::with_capacity(PENDING);
+        let mut placed = FALSE;
+        for k in 0..PENDING - 1 {
+            let here = match k {
+                0 => empty[0],
+                _ => {
+                    let prev_taken = self.lower_select_with(empty[k - 1], |_| FALSE, |_| TRUE);
+                    self.and(empty[k], prev_taken)
+                }
+            };
+            let here = self.and(changed, here);
+            placed = self.or(placed, here);
+            push.push(here);
+        }
+        let spill = self.lower_select_with(placed, |_| FALSE, |_| TRUE);
+        push.push(self.and(changed, spill));
+
+        let mut pushed_at = Vec::with_capacity(PENDING);
+        let mut pushed_to = Vec::with_capacity(PENDING);
+        for k in 0..PENDING {
+            let (at, to, p) = (kept_at[k], to_prev[k], push[k]);
+            pushed_at.push(self.ctx.make_select(p, |_s, b| if b { starts } else { at }));
+            pushed_to.push(self.ctx.make_select(p, |_s, b| if b { target } else { to }));
+        }
+
+        // -- start the head of the queue once its instant arrives -------------
+        // Pushing before testing is what makes `td` of zero start the ramp in this
+        // evaluation rather than the next one.
+        let head_at = pushed_at[0];
+        let head_set = self.ctx.ins().flt(head_at, unset_test);
+        let head_due = self.ctx.ins().fle(head_at, now);
+        let due = self.and(head_set, head_due);
+        let new_dest = pushed_to[0];
+
+        // The interrupt rules. "If the new final value level is below the value level
+        // at the point of the interruption (the current value), transition() uses the
+        // old destination as the origin. If the new destination is above the current
+        // level, the first origin is retained." A transition that has already arrived
+        // has no origin to retain and starts from where it is.
+        let in_flight = self.ctx.ins().fne(cur, dest);
+        let below = self.ctx.ins().flt(new_dest, cur);
+        let kept_origin = self.ctx.make_select(below, |_s, b| if b { dest } else { origin });
+        let new_origin = self.ctx.make_select(in_flight, |_s, b| if b { kept_origin } else { cur });
+        // Retaining the first origin assumes the new destination lies beyond the
+        // current value, which is the case the clause is written for. A destination
+        // *between* the origin and the current value would otherwise be given a slope
+        // pointing away from it, so fall back to a fresh transition there.
+        let from_origin = self.ctx.ins().fsub(cur, new_origin);
+        let to_dest = self.ctx.ins().fsub(new_dest, cur);
+        let spanned = self.ctx.ins().fmul(from_origin, to_dest);
+        let usable = self.ctx.ins().fge(spanned, F_ZERO);
+        let new_origin = self.ctx.make_select(usable, |_s, b| if b { new_origin } else { cur });
+
+        // "forces all positive transitions of expr to occur over rise_time and all
+        // negative transitions to occur in fall_time", positive measured from the
+        // origin. Both have been floored, so the slope needs no divisor guard.
+        let up = self.ctx.ins().fgt(new_dest, new_origin);
+        let new_span = self.ctx.make_select(up, |_s, b| if b { rise } else { fall });
+        let swing = self.ctx.ins().fsub(new_dest, new_origin);
+        let new_slope = self.ctx.ins().fdiv(swing, new_span);
+
+        let t0_next = self.ctx.make_select(due, |_s, b| if b { now } else { t0 });
+        let v0_next = self.ctx.make_select(due, |_s, b| if b { cur } else { v0 });
+        let dest_next = self.ctx.make_select(due, |_s, b| if b { new_dest } else { dest });
+        let origin_next = self.ctx.make_select(due, |_s, b| if b { new_origin } else { origin });
+        let slope_next = self.ctx.make_select(due, |_s, b| if b { new_slope } else { slope });
+        let span_prev = self.ctx.retained_prev(s_span);
+        let span_next = self.ctx.make_select(due, |_s, b| if b { new_span } else { span_prev });
+
+        // The first evaluation sits at the target with nothing in flight.
+        let t0_next = self.ctx.make_select(first, |_s, b| if b { now } else { t0_next });
+        let v0_next = self.ctx.make_select(first, |_s, b| if b { target } else { v0_next });
+        let dest_next = self.ctx.make_select(first, |_s, b| if b { target } else { dest_next });
+        let origin_next = self.ctx.make_select(first, |_s, b| if b { target } else { origin_next });
+        let slope_next = self.ctx.make_select(first, |_s, b| if b { F_ZERO } else { slope_next });
+        let span_next = self.ctx.make_select(first, |_s, b| if b { F_ZERO } else { span_next });
+
+        // Taking the head shifts the rest of the queue up.
+        for k in 0..PENDING {
+            let next_at = if k + 1 < PENDING { pushed_at[k + 1] } else { unset };
+            let next_to = if k + 1 < PENDING { pushed_to[k + 1] } else { F_ZERO };
+            let (at, to) = (pushed_at[k], pushed_to[k]);
+            let at = self.ctx.make_select(due, |_s, b| if b { next_at } else { at });
+            let to = self.ctx.make_select(due, |_s, b| if b { next_to } else { to });
+            self.ctx.store_retained(queue[k].0, at);
+            self.ctx.store_retained(queue[k].1, to);
+
+            // A leading corner: every instant still pending wants a timepoint.
+            let togo = self.ctx.ins().fsub(at, now);
+            let ahead = self.ctx.ins().fgt(togo, F_ZERO);
+            let set = self.ctx.ins().flt(at, unset_test);
+            let want = self.and(ahead, set);
+            let bound = self.ctx.make_select(want, |_s, b| if b { togo } else { no_bound });
+            self.bound_step(bound);
+        }
+
+        self.ctx.store_retained(s_tgt, target);
+        self.ctx.store_retained(s_t0, t0_next);
+        self.ctx.store_retained(s_v0, v0_next);
+        self.ctx.store_retained(s_dest, dest_next);
+        self.ctx.store_retained(s_origin, origin_next);
+        self.ctx.store_retained(s_slope, slope_next);
+        self.ctx.store_retained(s_span, span_next);
+
+        // The trailing corner: where the ramp in progress arrives. Skipped when the
+        // transition time is the negligible default, per the clause's own exemption
+        // against forcing very small timesteps for it.
+        let remaining = self.ctx.ins().fsub(dest_next, v0_next);
+        let moving = self.ctx.ins().fne(slope_next, F_ZERO);
+        let divisor = self.ctx.make_select(moving, |_s, b| if b { slope_next } else { one });
+        let duration = self.ctx.ins().fdiv(remaining, divisor);
+        let arrival = self.ctx.ins().fadd(t0_next, duration);
+        let togo = self.ctx.ins().fsub(arrival, now);
+        let ahead = self.ctx.ins().fgt(togo, F_ZERO);
+        let resolved = self.ctx.ins().fgt(span_next, min_ramp);
+        let want = self.and(ahead, moving);
+        let want = self.and(want, resolved);
+        let bound = self.ctx.make_select(want, |_s, b| if b { togo } else { no_bound });
+        self.bound_step(bound);
+
+        cur
     }
 
     fn lower_integral(&mut self, kind: IdtKind, args: &[ExprId]) -> Value {
