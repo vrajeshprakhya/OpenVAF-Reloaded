@@ -27,6 +27,7 @@ use hir_def::{
 };
 pub use hir_def::{BuiltIn, Case, Literal, ParamSysFun, Path, Type};
 pub use hir_ty::builtin;
+pub use hir_ty::table_model;
 use hir_ty::db::HirTyDB as HirDatabase;
 use hir_ty::inference;
 pub use hir_ty::types::Signature;

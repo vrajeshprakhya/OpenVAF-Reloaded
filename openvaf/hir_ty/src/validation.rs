@@ -1,7 +1,6 @@
 use basedb::diagnostics::{Diagnostic, Label, LabelStyle, Report};
 use basedb::lints::builtin::{
-    const_simparam, ignored_discontinuity, trivial_probe, unscheduled_event,
-    variant_const_simparam,
+    const_simparam, ignored_discontinuity, trivial_probe, unscheduled_event, variant_const_simparam,
 };
 use basedb::lints::{self, Lint, LintSrc};
 use basedb::{AstIdMap, BaseDB, FileId};
@@ -453,6 +452,17 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                 }
 
                 res
+            }
+            BodyValidationDiagnostic::TableModel { expr, ref err } => {
+                let FileSpan { range, file } = self.expr_src(expr);
+                Report::error().with_message(format!("invalid table model: {err}")).with_labels(
+                    vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: file,
+                        range: range.into(),
+                        message: "invalid $table_model".to_owned(),
+                    }],
+                )
             }
             BodyValidationDiagnostic::UnsupportedFunction { expr, func } => {
                 let FileSpan { range, file } = self.expr_src(expr);
