@@ -11,6 +11,7 @@ use hir::signatures::{
     SIMPARAM_DEFAULT, SIMPARAM_NO_DEFAULT, STR_EQ,
 };
 use hir::table_model;
+use hir::zi_filter;
 use hir::{
     Body, BodyRef, BuiltIn, Expr, ExprId, Literal, /*ParamSysFun,*/ Ref, ResolvedFun, Stmt,
     Type,
@@ -1339,6 +1340,10 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
             BuiltIn::table_model => self.lower_table_model(args),
 
+            BuiltIn::zi_nd | BuiltIn::zi_np | BuiltIn::zi_zd | BuiltIn::zi_zp => {
+                self.lower_zi_filter(builtin, args)
+            }
+
             _ => unreachable!(),
         }
     }
@@ -1459,6 +1464,186 @@ impl BodyLoweringCtx<'_, '_, '_> {
         }
     }
 
+    /// Which side of a Z-filter's transfer function each argument gives, per
+    /// VAMS-2023 4.5.12.1 to 4.5.12.4.
+    fn zi_sides(builtin: BuiltIn) -> (zi_filter::Side, zi_filter::Side) {
+        use zi_filter::Side::{Coeffs, Roots};
+        match builtin {
+            BuiltIn::zi_nd => (Coeffs, Coeffs),
+            BuiltIn::zi_zd => (Roots, Coeffs),
+            BuiltIn::zi_np => (Coeffs, Roots),
+            BuiltIn::zi_zp => (Roots, Roots),
+            _ => unreachable!("not a Z-transform filter"),
+        }
+    }
+
+    /// VAMS-2023 4.5.12:
+    ///
+    ///   zi_nd ( expr , n , d , T [ , tau [ , t0 ] ] )
+    ///
+    /// and the three other forms, which differ only in whether each side is given
+    /// as coefficients of `z^-k` or as roots. `hir::zi_filter` reduces all four to
+    /// one difference equation.
+    ///
+    /// These are discrete-time filters: "A filter with unity transfer function acts
+    /// like a simple sample-and-hold which samples every T seconds and exhibits no
+    /// delay." So the input is sampled on the grid `t0 + m*T`, the difference
+    /// equation runs once per sample, and the output transitions to the new value
+    /// over `tau`.
+    ///
+    /// Table 4-20 makes the coefficients, `T` and `t0` constant expressions, so the
+    /// whole sample grid and every coefficient is known here and the generated code
+    /// is a fixed dot product over retained history. Only `expr` and `tau` are
+    /// dynamic.
+    ///
+    /// The output is handed to [`Self::emit_transition`] rather than reimplemented:
+    /// 4.5.12 asks for the same thing 4.5.8 does, including that with no `tau`
+    /// given "the timestep is not controlled to resolve the trailing corner of the
+    /// transition", which is that code's own rule.
+    ///
+    /// Whatever cannot be built returns zero, which `hir_ty` makes unreachable by
+    /// rejecting the call first.
+    fn lower_zi_filter(&mut self, builtin: BuiltIn, args: &[ExprId]) -> Value {
+        let (num_side, den_side) = Self::zi_sides(builtin);
+        // A null `zeros` argument is the empty product: "The zeros argument may be
+        // represented as a null argument."
+        let num = match args.get(1) {
+            Some(&arg) if !self.body.is_missing(arg) => match self.const_real_array(arg) {
+                Some(num) => Some(num),
+                None => return F_ZERO,
+            },
+            _ => None,
+        };
+        let den = match args.get(2).copied().filter(|&a| !self.body.is_missing(a)) {
+            Some(arg) => match self.const_real_array(arg) {
+                Some(den) => den,
+                None => return F_ZERO,
+            },
+            None => return F_ZERO,
+        };
+        let filter = match zi_filter::Filter::build(num.as_deref(), num_side, &den, den_side) {
+            Ok(filter) => filter,
+            Err(_) => return F_ZERO,
+        };
+        // 4.5.14: a constant expression "remains static throughout an analysis",
+        // which a `parameter` does even though its value is the simulator's to set.
+        // `T` and `t0` only feed the scheduling arithmetic, never a coefficient, so
+        // they are lowered as values and a parameter works.
+        let period = self.lower_expr(args[3]);
+        let start = match args.get(5).copied().filter(|&a| !self.body.is_missing(a)) {
+            Some(arg) => self.lower_expr(arg),
+            None => F_ZERO,
+        };
+
+        let input = self.lower_expr(args[0]);
+        // `tau` is the one dynamic argument besides the input. Left at zero when
+        // absent, which `emit_transition` floors to its negligible default.
+        let tau = match args.get(4).copied().filter(|&a| !self.body.is_missing(a)) {
+            Some(arg) => self.lower_expr(arg),
+            None => F_ZERO,
+        };
+
+        let (m, n) = filter.order();
+        let now = self.ctx.use_param(ParamKind::Abstime);
+        let no_bound = self.ctx.fconst(f64::MAX);
+
+        // -- state -------------------------------------------------------------
+        // The next sample instant. A retained slot's initial value has to be a
+        // constant, and `t0` need not be one, so the first evaluation reads it from
+        // the argument instead: "t0 specifies the time of the first transition
+        // [...] If not given, the first transition occurs at t=0."
+        let s_next = self.ctx.alloc_retained_state(0.0);
+        // The sampled inputs, newest first, and the outputs behind the newest. The
+        // filter starts from rest, so every slot starts at zero.
+        let s_x: Vec<_> = (0..=m).map(|_| self.ctx.alloc_retained_state(0.0)).collect();
+        let s_y: Vec<_> = (0..n.max(1)).map(|_| self.ctx.alloc_retained_state(0.0)).collect();
+
+        let first = self.ctx.first_eval();
+        let next_held = self.ctx.retained_prev(s_next);
+        let next_prev = self.ctx.make_select(first, |_s, b| if b { start } else { next_held });
+        let x_prev: Vec<_> = s_x.iter().map(|&s| self.ctx.retained_prev(s)).collect();
+        let y_prev: Vec<_> = s_y.iter().map(|&s| self.ctx.retained_prev(s)).collect();
+
+        // -- has a sample instant arrived? -------------------------------------
+        // The same arithmetic `timer` uses, including skipping whole periods in
+        // case the solver stepped past several at once.
+        let one = self.ctx.fconst(1.0);
+        // "T [...] is mandatory, and shall be positive." A period that is not
+        // leaves the filter parked rather than dividing by zero; a literal one is
+        // rejected outright during validation.
+        let usable = self.ctx.ins().fgt(period, F_ZERO);
+        let divisor = self.ctx.make_select(usable, |_s, b| if b { period } else { one });
+        let due = self.ctx.ins().fge(now, next_prev);
+        let reached = self.and(due, usable);
+        let elapsed = self.ctx.ins().fsub(now, next_prev);
+        let periods = self.ctx.ins().fdiv(elapsed, divisor);
+        let periods = self.ctx.ins().floor(periods);
+        let periods = self.ctx.ins().fadd(periods, one);
+        let advance = self.ctx.ins().fmul(divisor, periods);
+        let after = self.ctx.ins().fadd(next_prev, advance);
+        let next = self.ctx.make_select(reached, |_s, b| if b { after } else { next_prev });
+        self.ctx.store_retained(s_next, next);
+
+        // Ask for a timepoint on the next sample instant, so the grid is the one
+        // the filter was written with rather than whatever the solver stepped onto.
+        let remaining = self.ctx.ins().fsub(next, now);
+        let ahead = self.ctx.ins().fgt(remaining, F_ZERO);
+        let bound = self.ctx.make_select(ahead, |_s, b| if b { remaining } else { no_bound });
+        self.bound_step(bound);
+
+        // -- the difference equation ------------------------------------------
+        // Shifted histories, as they would be if this evaluation takes a sample.
+        let mut x_new = Vec::with_capacity(m + 1);
+        x_new.push(input);
+        x_new.extend(x_prev.iter().take(m).copied());
+
+        //   y[m] = ( sum_k n_k x[m-k] - sum_{k>=1} d_k y[m-k] ) / d_0
+        let inv_d0 = 1.0 / filter.den[0];
+        let mut acc = F_ZERO;
+        for (k, coeff) in filter.num.iter().enumerate() {
+            let term = self.emit_scaled(x_new[k], coeff * inv_d0);
+            acc = if acc == F_ZERO { term } else { self.ctx.ins().fadd(acc, term) };
+        }
+        for (k, coeff) in filter.den.iter().enumerate().skip(1) {
+            let term = self.emit_scaled(y_prev[k - 1], -coeff * inv_d0);
+            acc = if acc == F_ZERO { term } else { self.ctx.ins().fadd(acc, term) };
+        }
+
+        let mut y_new = Vec::with_capacity(y_prev.len());
+        y_new.push(acc);
+        y_new.extend(y_prev.iter().take(y_prev.len() - 1).copied());
+
+        // A sample is only taken when an instant has arrived; otherwise the history
+        // and the held output stand.
+        for (k, &slot) in s_x.iter().enumerate() {
+            let (new, old) = (x_new[k], x_prev[k]);
+            let val = self.ctx.make_select(reached, |_s, b| if b { new } else { old });
+            self.ctx.store_retained(slot, val);
+        }
+        for (k, &slot) in s_y.iter().enumerate() {
+            let (new, old) = (y_new[k], y_prev[k]);
+            let val = self.ctx.make_select(reached, |_s, b| if b { new } else { old });
+            self.ctx.store_retained(slot, val);
+        }
+
+        // The output is the newest sample, held until the next one, ramped over
+        // `tau`. No delay: a unity filter "exhibits no delay".
+        let held = self.ctx.make_select(reached, |_s, b| if b { acc } else { y_prev[0] });
+        self.emit_transition(held, F_ZERO, tau, tau)
+    }
+
+    /// `val * coeff` with the constant folded away where it is 0 or 1.
+    fn emit_scaled(&mut self, val: Value, coeff: f64) -> Value {
+        if coeff == 0.0 {
+            return F_ZERO;
+        }
+        if coeff == 1.0 {
+            return val;
+        }
+        let coeff = self.ctx.fconst(coeff);
+        self.ctx.ins().fmul(val, coeff)
+    }
+
     /// `min(a, b)` on reals. The MIR has no intrinsic for it.
     fn fmin(&mut self, a: Value, b: Value) -> Value {
         let lt = self.ctx.ins().flt(a, b);
@@ -1540,6 +1725,18 @@ impl BodyLoweringCtx<'_, '_, '_> {
     /// `cross` or `timer` event in the same module, and those already steer the
     /// solver onto the instant it happens.
     fn lower_transition(&mut self, target: Value, args: &[ExprId]) -> Value {
+        let td = self.opt_arg(args, 1).unwrap_or(F_ZERO);
+        let rise = self.opt_arg(args, 2).unwrap_or(F_ZERO);
+        // "If only a positive rise_time value is specified, the simulator uses it for
+        // both rise and fall times."
+        let fall = self.opt_arg(args, 3).unwrap_or(rise);
+        self.emit_transition(target, td, rise, fall)
+    }
+
+    /// The transition machinery itself, which 4.5.12's Z-transform filters share:
+    /// the clause describes their output in the same terms, down to not resolving
+    /// the trailing corner when the transition time is the default.
+    fn emit_transition(&mut self, target: Value, td: Value, rise: Value, fall: Value) -> Value {
         // 4.5.8: with `rise_time`/`fall_time` unspecified or zero they "default to the
         // value defined by `default_transition"; without that directive -- which this
         // compiler does not implement -- "a negligible, but non-zero, transition time
@@ -1557,11 +1754,6 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
         let now = self.ctx.use_param(ParamKind::Abstime);
 
-        let td = self.opt_arg(args, 1).unwrap_or(F_ZERO);
-        let rise = self.opt_arg(args, 2).unwrap_or(F_ZERO);
-        // "If only a positive rise_time value is specified, the simulator uses it for
-        // both rise and fall times."
-        let fall = self.opt_arg(args, 3).unwrap_or(rise);
         let min_ramp = self.ctx.fconst(MIN_RAMP);
         let rise = self.fmax(rise, min_ramp);
         let fall = self.fmax(fall, min_ramp);

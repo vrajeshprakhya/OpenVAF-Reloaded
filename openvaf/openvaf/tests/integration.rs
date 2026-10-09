@@ -6,6 +6,7 @@ use camino::Utf8Path;
 use expect_test::expect_file;
 use float_cmp::assert_approx_eq;
 use hir::table_model;
+use hir::zi_filter;
 use mini_harness::{harness, Result};
 use openvaf::{CompilationDestination, CompilationTermination, LLVMCodeGenOptLevel};
 use stdx::{ignore_dev_tests, openvaf_test_data, project_root};
@@ -1335,6 +1336,92 @@ fn test_table_model() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 4.5.12: the Z-transform filters, against the difference equation.
+///
+/// `hir::zi_filter` reduces all four forms to coefficients and runs them over a
+/// sequence of samples; the compiled model is stepped over the same grid and must
+/// agree sample for sample. The default transition time is negligible, so the
+/// output has already arrived by the time the next step reads it. See `zifilt.va`.
+fn test_zi_filter() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    use zi_filter::Side::{Coeffs, Roots};
+    let build = |num: Option<&[f64]>, num_side, den: &[f64], den_side| {
+        zi_filter::Filter::build(num, num_side, den, den_side).expect("filter")
+    };
+    let hold = build(Some(&[1.0]), Coeffs, &[1.0], Coeffs);
+    let delay = build(Some(&[0.0, 1.0]), Coeffs, &[1.0], Coeffs);
+    let iir = build(Some(&[1.0]), Coeffs, &[1.0, -0.5], Coeffs);
+    // The same pole as a root with a null zeros argument: 4.5.12 makes that the
+    // empty product, so this must reduce to exactly the `iir` coefficients.
+    let zp = build(None, Roots, &[0.5, 0.0], Roots);
+    assert_eq!(zp, iir);
+    let fir = build(Some(&[0.25, 0.5, 0.25]), Coeffs, &[1.0], Coeffs);
+
+    // A sequence with sign changes and a zero, so a wrong history shows up.
+    let input = [1.0, -2.0, 0.0, 3.0, 0.5, -1.5, 4.0];
+    let want_hold = hold.run(&input);
+    let want_delay = delay.run(&input);
+    let want_iir = iir.run(&input);
+    let want_fir = fir.run(&input);
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("zifilt.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // Two steps per sample. The first lands on the sample instant `m*T`, where the
+    // new sample is taken but the output is still the old value: the clause has the
+    // output *transition* to it, and a transition is continuous at its own leading
+    // corner. The second step settles clear of that corner, which is where the new
+    // value can be read. T is 1.0 and t0 defaults to 0, so the first evaluation is
+    // itself a sample instant.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    x: f64,
+                    first: bool| {
+        let mut out = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for half in 0..2 {
+            if !(first && half == 0) {
+                sim.next_iter();
+                sim.advance_time(0.5);
+            }
+            sim.set_voltage("din", x);
+            for node in ["hold", "delay", "iir", "zp", "fir"] {
+                sim.set_voltage(node, 0.0);
+            }
+            instance.eval(model, sim, EvalFlags::empty());
+            instance.load_dae(model, sim);
+            out = (
+                sim.read_residual("flow(hold)").0,
+                sim.read_residual("flow(delay)").0,
+                sim.read_residual("flow(iir)").0,
+                sim.read_residual("flow(zp)").0,
+                sim.read_residual("flow(fir)").0,
+            );
+        }
+        out
+    };
+
+    for (m, &x) in input.iter().enumerate() {
+        let (got_hold, got_delay, got_iir, got_zp, got_fir) =
+            step(&instance, &model, &mut sim, x, m == 0);
+        float_cmp::assert_approx_eq!(f64, got_hold, want_hold[m], epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got_delay, want_delay[m], epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got_iir, want_iir[m], epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got_fir, want_fir[m], epsilon = 1e-9);
+        // The root form and the coefficient form are the same filter, so they must
+        // not merely both be close to the oracle but agree exactly.
+        float_cmp::assert_approx_eq!(f64, got_zp, got_iir, epsilon = 1e-12);
+    }
+
+    Ok(())
+}
+
 harness! {
     // TODO: run this in CI, somehow this test is flakey tough regarding the linker invocation (and really slow)
     Test::from_dir("integration", &integration_test, &ignore_dev_tests, &project_root().join("integration_tests")),
@@ -1344,5 +1431,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter)]
 }

@@ -287,10 +287,15 @@ bultins! {
     }
 
     // all zi filters have the same signature
+    // VAMS-2023 4.5.12: `zi_nd ( expr , n , d , T [ , tau [ , t0 ] ] )` and the
+    // three other forms. The two vectors are coefficients of `z^-k` or roots
+    // depending on the form, `T` is the mandatory sampling period, `tau` the
+    // optional transition time of the output and `t0` the optional instant of the
+    // first transition.
     ZI_FILTER = const {
-        fn ZI_NO_TOL(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real)) -> Real;
-        fn ZI_TOL(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real), Val(Real)) -> Real;
-        fn ZI_NATURE_TOL(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real), Val(Real), Val(Real)) -> Real;
+        fn ZI_T(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real)) -> Real;
+        fn ZI_T_TAU(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real), Val(Real)) -> Real;
+        fn ZI_T_TAU_T0(Val(Real),ArrayAnyLength{ty: Real},ArrayAnyLength{ty: Real}, Val(Real), Val(Real), Val(Real)) -> Real;
     }
 
     ABSDELAY = const {

@@ -19,6 +19,7 @@ use crate::inference::{BranchWrite, InferenceResult, ResolvedFun};
 use crate::lower::BranchKind;
 use crate::table_model;
 use crate::types::{Signature, Ty};
+use crate::zi_filter;
 use hir_def::Type;
 
 // `EventFun` is an analog event function used outside `@(...)` (VAMS-2023 5.10.3).
@@ -100,9 +101,11 @@ pub enum BodyValidationDiagnostic {
         stmt: StmtId,
     },
 
-    /// VAMS-2023 9.21: the call cannot be turned into a table at compile time.
-    TableModel {
+    /// An analog operator whose constant arguments cannot be reduced at compile
+    /// time: a `$table_model` table or a Z-transform filter.
+    InvalidOperator {
         expr: ExprId,
+        what: &'static str,
         err: String,
     },
     UnsupportedFunction {
@@ -756,8 +759,12 @@ impl ExprValidator<'_, '_> {
         }
     }
 
+    fn operator_err(&mut self, expr: ExprId, what: &'static str, err: String) {
+        self.parent.diagnostics.push(BodyValidationDiagnostic::InvalidOperator { expr, what, err });
+    }
+
     fn table_err(&mut self, expr: ExprId, err: String) {
-        self.parent.diagnostics.push(BodyValidationDiagnostic::TableModel { expr, err });
+        self.operator_err(expr, "$table_model", err)
     }
 
     fn const_real(&self, expr: ExprId) -> Option<f64> {
@@ -905,6 +912,92 @@ impl ExprValidator<'_, '_> {
         }
     }
 
+    /// VAMS-2023 4.5.12: the Z-transform filters.
+    ///
+    /// Table 4-20 makes the two vectors, `T` and `t0` constant expression
+    /// arguments, so the filter is reduced to coefficients here and the lowering
+    /// can assume it succeeds. An array whose contents the module computes at run
+    /// time is not a constant expression, for the same reason a `$table_model`
+    /// data column is not: the filter is compiled into the model.
+    fn validate_zi_filter(&mut self, expr: ExprId, call: BuiltIn, args: &[ExprId]) {
+        use zi_filter::Side::{Coeffs, Roots};
+        let name = match call {
+            BuiltIn::zi_nd => "$zi_nd",
+            BuiltIn::zi_zd => "$zi_zd",
+            BuiltIn::zi_np => "$zi_np",
+            BuiltIn::zi_zp => "$zi_zp",
+            _ => return,
+        };
+        let (num_side, den_side) = match call {
+            BuiltIn::zi_nd => (Coeffs, Coeffs),
+            BuiltIn::zi_zd => (Roots, Coeffs),
+            BuiltIn::zi_np => (Coeffs, Roots),
+            BuiltIn::zi_zp => (Roots, Roots),
+            _ => return,
+        };
+        if args.len() < 4 {
+            // The signature table has already reported the shape of the call.
+            return;
+        }
+
+        // "The zeros argument may be represented as a null argument."
+        let num = match args.get(1) {
+            Some(&arg) if !matches!(self.parent.body.exprs[arg], Expr::Missing) => {
+                match self.const_real_column(arg) {
+                    Some(num) => Some(num),
+                    None => {
+                        self.zi_err(
+                            expr,
+                            name,
+                            if num_side == Roots { "zeros" } else { "numerator" },
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
+        let den = match self.const_real_column(args[2]) {
+            Some(den) => den,
+            None => {
+                self.zi_err(expr, name, if den_side == Roots { "poles" } else { "denominator" });
+                return;
+            }
+        };
+
+        // 4.5.14: a constant expression "remains static throughout an analysis",
+        // which a parameter does, and `T` and `t0` only feed the scheduling
+        // arithmetic rather than any coefficient, so they are lowered as values and
+        // need not be known here. A literal period can still be checked.
+        if let Some(period) = self.const_real(args[3]) {
+            if period <= 0.0 {
+                self.operator_err(
+                    expr,
+                    name,
+                    format!("the sampling period is {period}; 4.5.12 requires T to be positive"),
+                );
+                return;
+            }
+        }
+
+        if let Err(err) = zi_filter::Filter::build(num.as_deref(), num_side, &den, den_side) {
+            self.operator_err(expr, name, err.0);
+        }
+    }
+
+    fn zi_err(&mut self, expr: ExprId, name: &'static str, what: &str) {
+        self.operator_err(
+            expr,
+            name,
+            format!(
+                "the {what} vector has to be an array of constants. Table 4-20 makes it a \
+                 constant expression argument, and the filter is compiled into the model, so an \
+                 array the module computes at run time cannot be read here: write it as an array \
+                 literal"
+            ),
+        );
+    }
+
     fn validate_builtin(
         &mut self,
         name: &Option<Path>,
@@ -919,6 +1012,9 @@ impl ExprValidator<'_, '_> {
                 .diagnostics
                 .push(BodyValidationDiagnostic::UnsupportedFunction { expr, func: call }),
             BuiltIn::table_model => self.validate_table_model(expr, args),
+            BuiltIn::zi_nd | BuiltIn::zi_np | BuiltIn::zi_zd | BuiltIn::zi_zp => {
+                self.validate_zi_filter(expr, call, args)
+            }
             BuiltIn::discontinuity => {
                 // The `$discontinuity(-1)` form is part of `$limit` (9.17.3) and is
                 // lowered; every other degree is dropped, so say so rather than let
