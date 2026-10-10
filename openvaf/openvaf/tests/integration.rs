@@ -8,7 +8,7 @@ use float_cmp::assert_approx_eq;
 use hir::table_model;
 use hir::zi_filter;
 use mini_harness::{harness, Result};
-use openvaf::{CompilationDestination, CompilationTermination, LLVMCodeGenOptLevel};
+use openvaf::{AbsDelayMode, CompilationDestination, CompilationTermination, LLVMCodeGenOptLevel};
 use stdx::{ignore_dev_tests, openvaf_test_data, project_root};
 use target::spec::Target;
 
@@ -19,12 +19,22 @@ mod load;
 mod mock_sim;
 
 fn compile_and_load(root_file: &Utf8Path) -> &'static OsdiDescriptor {
+    compile_and_load_with(root_file, AbsDelayMode::Simulator, "osdi")
+}
+
+/// Compile with a chosen `absdelay` realization. The two realizations of one model
+/// have to land in different libraries, hence the extension.
+fn compile_and_load_with(
+    root_file: &Utf8Path,
+    absdelay: AbsDelayMode,
+    extension: &str,
+) -> &'static OsdiDescriptor {
     let openvaf_opts = openvaf::Opts {
         defines: Vec::new(),
         codegen_opts: Vec::new(),
         lints: Vec::new(),
         input: root_file.to_path_buf(),
-        output: CompilationDestination::Path { lib_file: root_file.with_extension("osdi") },
+        output: CompilationDestination::Path { lib_file: root_file.with_extension(extension) },
         include: Vec::new(),
         opt_lvl: LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
         target: Target::host_target().expect(
@@ -37,6 +47,7 @@ fn compile_and_load(root_file: &Utf8Path) -> &'static OsdiDescriptor {
         dump_unopt_mir: false,
         dump_ir: false,
         dump_unopt_ir: false,
+        absdelay,
     };
 
     let res = openvaf::compile(&openvaf_opts).unwrap();
@@ -1422,6 +1433,147 @@ fn test_zi_filter() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 4.5.7: `absdelay` through the descriptor protocol.
+///
+/// The compiler's half of the protocol is what is under test here: the delay the
+/// model writes into its instance data each evaluation, and the node indices the
+/// descriptor gives for the input and the output. `mock_sim`'s `AbsDelay` is the
+/// other half, kept as small as it can be while still being faithful -- a history
+/// of accepted timepoints, read back at `t - td`.
+///
+/// The input is a ramp `x(t) = t`, so `Output(t) = Input(max(t - td, 0))` is exact
+/// however the history is interpolated. See `absdelay.va`.
+fn test_absdelay() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("absdelay.va"))?;
+    assert_eq!(desc.absdelay_count, 4, "one descriptor entry per absdelay");
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // A delay drives an implicit unknown of its own, which the contribution then
+    // ties to the output node, so that unknown is what the descriptor names as the
+    // output; they come in source order.
+    let (dout, dfrozen, dvar, dtwice) = (
+        "implicit_equation_0",
+        "implicit_equation_1",
+        "implicit_equation_2",
+        "implicit_equation_3",
+    );
+
+    const DT: f64 = 0.25;
+    let mut t = 0.0;
+    for step in 0..25 {
+        if step != 0 {
+            sim.next_iter();
+            sim.advance_time(DT);
+            t += DT;
+        }
+        sim.set_voltage("din", t);
+        for node in ["dout", "dfrozen", "dvar", "dtwice"] {
+            sim.set_voltage(node, 0.0);
+        }
+        instance.eval(&model, &mut sim, EvalFlags::empty());
+        instance.load_dae(&model, &mut sim);
+
+        // What the model wrote into the instance data. `dfrozen` is the interesting
+        // one: its argument is `td + $abstime` and it grows, but with no `maxdelay`
+        // the clause freezes it at its first value.
+        float_cmp::assert_approx_eq!(f64, sim.absdelay_at(dout).delay, 1.0, epsilon = 1e-12);
+        float_cmp::assert_approx_eq!(f64, sim.absdelay_at(dfrozen).delay, 1.0, epsilon = 1e-12);
+        float_cmp::assert_approx_eq!(f64, sim.absdelay_at(dtwice).delay, 2.0, epsilon = 1e-12);
+        float_cmp::assert_approx_eq!(
+            f64,
+            sim.absdelay_at(dvar).delay,
+            (1.0 + t).min(4.0),
+            epsilon = 1e-12
+        );
+
+        // And what the delay comes to. A `td` the input has not reached yet reads
+        // the oldest sample, which here is `input(0)`.
+        let want = |delay: f64| (t - delay).max(0.0);
+        float_cmp::assert_approx_eq!(f64, sim.absdelay_at(dout).delayed, want(1.0), epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(
+            f64,
+            sim.absdelay_at(dfrozen).delayed,
+            want(1.0),
+            epsilon = 1e-9
+        );
+        float_cmp::assert_approx_eq!(
+            f64,
+            sim.absdelay_at(dtwice).delayed,
+            want(2.0),
+            epsilon = 1e-9
+        );
+        float_cmp::assert_approx_eq!(
+            f64,
+            sim.absdelay_at(dvar).delayed,
+            want((1.0 + t).min(4.0)),
+            epsilon = 1e-9
+        );
+    }
+
+    Ok(())
+}
+
+/// VAMS-2023 4.5.7 realized inside the model (`--absdelay in-model`), which is the
+/// same clause with no simulator support at all: the history is retained state and
+/// the output is an ordinary contribution, so the delay shows up in the residual.
+///
+/// Same ramp, same expectations, and the same model source -- which is the point.
+fn test_absdelay_in_model() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let main_file = openvaf_test_data("osdi").join("absdelay.va");
+    let main_file = Utf8Path::from_path(&main_file).unwrap();
+    let desc = compile_and_load_with(
+        main_file,
+        AbsDelayMode::InModel { depth: AbsDelayMode::DEFAULT_DEPTH },
+        "in_model.osdi",
+    );
+    assert_eq!(desc.absdelay_count, 0, "nothing is asked of the simulator");
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    const DT: f64 = 0.25;
+    let mut t = 0.0;
+    for step in 0..25 {
+        if step != 0 {
+            sim.next_iter();
+            sim.advance_time(DT);
+            t += DT;
+        }
+        sim.set_voltage("din", t);
+        for node in ["dout", "dfrozen", "dvar", "dtwice"] {
+            sim.set_voltage(node, 0.0);
+        }
+        instance.eval(&model, &mut sim, EvalFlags::empty());
+        instance.load_dae(&model, &mut sim);
+
+        let want = |delay: f64| (t - delay).max(0.0);
+        let got = |node: &str| sim.read_residual(node).0;
+        float_cmp::assert_approx_eq!(f64, got("flow(dout)"), want(1.0), epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got("flow(dfrozen)"), want(1.0), epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, got("flow(dtwice)"), want(2.0), epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(
+            f64,
+            got("flow(dvar)"),
+            want((1.0 + t).min(4.0)),
+            epsilon = 1e-9
+        );
+    }
+
+    Ok(())
+}
+
 harness! {
     // TODO: run this in CI, somehow this test is flakey tough regarding the linker invocation (and really slow)
     Test::from_dir("integration", &integration_test, &ignore_dev_tests, &project_root().join("integration_tests")),
@@ -1431,5 +1583,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model)]
 }

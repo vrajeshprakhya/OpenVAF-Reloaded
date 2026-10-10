@@ -8,8 +8,8 @@ use mir_build::{FuncInstBuilder, FunctionBuilder, Place};
 use typed_indexmap::TiSet;
 
 use crate::{
-    CallBackKind, HirInterner, ImplicitEquation, ImplicitEquationKind, LimitState, ParamKind,
-    PlaceKind, RetainedState,
+    AbsDelayMode, CallBackKind, HirInterner, ImplicitEquation, ImplicitEquationKind, LimitState,
+    ParamKind, PlaceKind, RetainedState,
 };
 
 pub struct LoweringCtx<'a, 'c> {
@@ -38,6 +38,8 @@ pub struct LoweringCtx<'a, 'c> {
     pub function_exit: Option<Block>,
     /// Function whose return place early `return` statements write into.
     pub function_return: Option<hir::Function>,
+    /// How `absdelay` is realized (VAMS-2023 4.5.7). See [`AbsDelayMode`].
+    pub absdelay: AbsDelayMode,
 }
 
 /// CFG targets for the innermost enclosing loop.
@@ -70,11 +72,17 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
             loop_stack: Vec::new(),
             function_exit: None,
             function_return: None,
+            absdelay: AbsDelayMode::Simulator,
         }
     }
 
     pub fn with_tagged_vars(mut self, vars: AHashSet<Variable>) -> Self {
         self.tagged_vars = vars;
+        self
+    }
+
+    pub fn with_absdelay(mut self, mode: AbsDelayMode) -> Self {
+        self.absdelay = mode;
         self
     }
 

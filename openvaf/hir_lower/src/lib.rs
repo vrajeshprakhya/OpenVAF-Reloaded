@@ -279,6 +279,35 @@ pub struct AbsDelayInfo {
     pub max_delay: Option<Value>,
 }
 
+/// How `absdelay` (VAMS-2023 4.5.7) is realized.
+///
+/// The operator needs the input's history over the delay window, and a single model
+/// evaluation has no history. There are two ways to come by it and they are not
+/// equivalent, so this is a choice rather than an optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsDelayMode {
+    /// Hand the delay to the simulator through the OSDI descriptor
+    /// ([`AbsDelayInfo`] becomes `OsdiAbsDelayInfo`): it owns the history and stamps
+    /// the output row. Exact, and the output row is *only* stamped there -- a
+    /// simulator that does not implement the protocol leaves it empty and its matrix
+    /// singular.
+    Simulator,
+    /// Keep the history in the model: a shift register of `depth` retained
+    /// (time, value) pairs, linear interpolation between them, and `$bound_step`
+    /// capped at their spacing. Runs on any OSDI simulator, at the cost of resolving
+    /// the delay to that spacing instead of exactly.
+    InModel { depth: usize },
+}
+
+impl AbsDelayMode {
+    /// Deep enough that the delay is resolved to a few percent, shallow enough that
+    /// the timestep cap it implies is not punishing.
+    pub const DEFAULT_DEPTH: usize = 32;
+    /// Two samples bracket one interval; a third is the one that may fall off the
+    /// end of the window while the other two still cover the target time.
+    pub const MIN_DEPTH: usize = 3;
+}
+
 /// A mapping between abstractions used in the MIR and the corresponding
 /// information from the HIR. This allows the MIR to remain independent of the frontend/HIR
 #[derive(Debug, PartialEq, Clone)]
@@ -490,6 +519,7 @@ pub struct MirBuilder<'a> {
     /// When set, lower the module's imperative `initial`/`final` procedural body
     /// (the standalone runner lane) instead of the analog DAE bodies.
     procedural: bool,
+    absdelay: AbsDelayMode,
 }
 
 impl<'a> MirBuilder<'a> {
@@ -509,7 +539,15 @@ impl<'a> MirBuilder<'a> {
             lower_equations: false,
             tag_writes: false,
             procedural: false,
+            absdelay: AbsDelayMode::Simulator,
         }
+    }
+
+    /// How to realize `absdelay`; see [`AbsDelayMode`]. The descriptor protocol is
+    /// the default, so a caller that does not care keeps the ABI it had.
+    pub fn with_absdelay(mut self, mode: AbsDelayMode) -> Self {
+        self.absdelay = mode;
+        self
     }
 
     /// Lower the module's standalone `initial`/`final` procedural body instead of the
@@ -573,7 +611,8 @@ impl<'a> MirBuilder<'a> {
         let path = self.module.name(self.db);
 
         let mut ctx = LoweringCtx::new(self.db, builder, !self.lower_equations, &mut interner)
-            .with_tagged_vars(self.tagged_reads);
+            .with_tagged_vars(self.tagged_reads)
+            .with_absdelay(self.absdelay);
 
         if self.procedural {
             // Runner lane: lower only the imperative procedural body (all `initial`

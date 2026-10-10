@@ -25,8 +25,8 @@ use crate::body::BodyLoweringCtx;
 
 use crate::fmt::DisplayKind;
 use crate::{
-    CallBackKind, CurrentKind, IdtKind, ImplicitEquationKind, NoiseTable, ParamKind, PlaceKind,
-    RetFlag, RngDist,
+    AbsDelayMode, CallBackKind, CurrentKind, IdtKind, ImplicitEquationKind, NoiseTable, ParamKind,
+    PlaceKind, RetFlag, RngDist,
 };
 
 impl BodyLoweringCtx<'_, '_, '_> {
@@ -1152,10 +1152,21 @@ impl BodyLoweringCtx<'_, '_, '_> {
             BuiltIn::absdelay => {
                 let source = self.lower_expr(args[0]);
                 if self.ctx.no_equations {
+                    // 4.5.7: "In DC and operating point analyses, absdelay() returns
+                    // the value of its input", and an op-var or small-signal setup has
+                    // no time axis to delay along either.
                     return source;
                 }
-                let delay = self.lower_expr(args[1]);
-                let max_delay = (signature == ABSDELAY_MAX).then(|| self.lower_expr(args[2]));
+                let raw_delay = self.lower_expr(args[1]);
+                let raw_max = (signature == ABSDELAY_MAX).then(|| self.lower_expr(args[2]));
+                let (delay, window) = self.absdelay_window(raw_delay, raw_max);
+                // The history has to come from somewhere. Either the simulator keeps
+                // it, which is exact but needs the descriptor protocol implemented, or
+                // the model keeps it, which runs anywhere.
+                if let AbsDelayMode::InModel { depth } = self.ctx.absdelay {
+                    return self.emit_absdelay(source, delay, window, depth);
+                }
+                let max_delay = raw_max.map(|_| window);
 
                 let source_pair = match self.ctx.dfg().value_def(source) {
                     mir::ValueDef::Param(param) => {
@@ -1176,6 +1187,16 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 };
 
                 let (output, y) = self.ctx.implicit_equation(ImplicitEquationKind::AbsDelayOutput);
+                // The simulator reads these two out of the instance data, which makes
+                // them outputs of the evaluation even though no place points at them.
+                // Barriers mark them as such, so the pass that moves op-independent
+                // work into instance setup caches them instead of leaving the eval
+                // function holding a value that is no longer computed there. Without
+                // this a delay that is anything but a parameter or a literal --
+                // `absdelay(x, 2 * td)`, or the frozen delay above -- crashes the
+                // backend with "attempted to read undefined value".
+                let delay = self.ctx.ins().ensure_optbarrier(delay);
+                let max_delay = max_delay.map(|val| self.ctx.ins().ensure_optbarrier(val));
                 self.ctx.intern.absdelay.push(crate::AbsDelayInfo {
                     input,
                     output,
@@ -1654,6 +1675,174 @@ impl BodyLoweringCtx<'_, '_, '_> {
     fn fmax(&mut self, a: Value, b: Value) -> Value {
         let gt = self.ctx.ins().fgt(a, b);
         self.ctx.make_select(gt, |_s, t| if t { a } else { b })
+    }
+
+    /// VAMS-2023 4.5.7's rules for the delay itself, which both realizations of
+    /// `absdelay` need. Returns the delay in force and the span of history that has
+    /// to be kept to serve it.
+    ///
+    /// The two differ only when `maxdelay` is given, and that is the whole point of
+    /// the argument: it is what tells the simulator how far back to remember.
+    fn absdelay_window(&mut self, delay: Value, max_delay: Option<Value>) -> (Value, Value) {
+        // "In all cases td shall be a positive number." A negative one is not a
+        // prediction of the future, it is a mistake; the delay is floored instead.
+        let delay = self.fmax(delay, F_ZERO);
+        match max_delay {
+            // "If the optional maxdelay is specified, then td can vary. If td becomes
+            // greater than maxdelay, maxdelay will be used as a substitute for td."
+            Some(max) => {
+                let max = self.fmax(max, F_ZERO);
+                let delay = self.fmin(delay, max);
+                (delay, max)
+            }
+            // "If maxdelay is not specified, the value of td when the absdelay() is
+            // first evaluated shall be used and any future changes to td shall be
+            // ignored." A retained slot holds that first value. In dc, where time
+            // never moves, every point is still the first evaluation and the
+            // argument is read afresh -- which is right: the frozen value is
+            // per-analysis, and dc has no delay to speak of anyway.
+            None => {
+                let slot = self.ctx.alloc_retained_state(0.0);
+                let first = self.ctx.first_eval();
+                let held = self.ctx.retained_prev(slot);
+                let frozen = self.ctx.make_select(first, |_s, b| if b { delay } else { held });
+                self.ctx.store_retained(slot, frozen);
+                (frozen, frozen)
+            }
+        }
+    }
+
+    /// VAMS-2023 4.5.7 realized inside the model, for simulators that do not
+    /// implement the `OsdiAbsDelayInfo` protocol:
+    ///
+    ///   Output(t) = Input(max(t - td, 0))
+    ///
+    /// The operator needs the input's history, so the model carries it: `depth`
+    /// retained (time, value) pairs, newest first, with the value at `t - td` read
+    /// off by linear interpolation between the two samples that bracket it. The
+    /// clause asks for exactly that reading -- `absdelay` "implements the absolute
+    /// transport delay for continuous waveforms (use the transition() operator to
+    /// delay discrete-valued waveforms)", and interpolating a continuous waveform is
+    /// not an approximation of a different answer, it is the same answer the
+    /// simulator's own time discretization already gives.
+    ///
+    /// # A shift register, not a ring
+    ///
+    /// MIR has no memory operations, so a moving write index would have to be lowered
+    /// as a select chain per slot -- quadratic in the depth, for both the write and
+    /// the read. Shifting instead costs one select per slot, and nothing else about a
+    /// ring is wanted here: the samples are always read newest-to-oldest.
+    ///
+    /// # The sample grid
+    ///
+    /// The history has to span the delay, and `depth` samples cannot span it if they
+    /// are recorded closer together than `window / depth`. The solver's own stepping
+    /// is no help: it shrinks the step for reasons of its own, and a plain
+    /// record-every-step history would then quietly run out of window and read a
+    /// stale value. So a new sample is only recorded once it is at least a grid
+    /// spacing newer than the last one, which keeps the window covered whatever the
+    /// solver does, and `$bound_step` asks for a timepoint on the next grid instant,
+    /// which keeps the recording at that spacing and resolves the output's own
+    /// features to it.
+    ///
+    /// That spacing is the accuracy of this realization and the reason the descriptor
+    /// protocol is the default: a delay is resolved to `window / (depth - 2)`, and
+    /// the run takes at least that many steps per delay window.
+    fn emit_absdelay(&mut self, input: Value, delay: Value, window: Value, depth: usize) -> Value {
+        let depth = depth.max(AbsDelayMode::MIN_DEPTH);
+        let now = self.ctx.use_param(ParamKind::Abstime);
+        let one = self.ctx.fconst(1.0);
+        let no_bound = self.ctx.fconst(f64::MAX);
+
+        // -- state ------------------------------------------------------------
+        let slots: Vec<_> = (0..depth)
+            .map(|_| {
+                let at = self.ctx.alloc_retained_state(0.0);
+                let val = self.ctx.alloc_retained_state(0.0);
+                (at, val)
+            })
+            .collect();
+        let first = self.ctx.first_eval();
+        let mut t_prev = Vec::with_capacity(depth);
+        let mut v_prev = Vec::with_capacity(depth);
+        for &(at, val) in &slots {
+            let at = self.ctx.retained_prev(at);
+            let val = self.ctx.retained_prev(val);
+            // Nothing has been recorded yet, so the history reads flat at the input.
+            // That is the figure's own starting condition -- "From time 0 until 2s,
+            // the output remains at input(0)" -- and it makes the first point of any
+            // analysis a pass-through, as 4.5.7 requires of dc and the operating
+            // point.
+            t_prev.push(self.ctx.make_select(first, |_s, b| if b { now } else { at }));
+            v_prev.push(self.ctx.make_select(first, |_s, b| if b { input } else { val }));
+        }
+
+        // -- the sample grid --------------------------------------------------
+        let spacing = self.ctx.fconst(1.0 / (depth - 2) as f64);
+        let step = self.ctx.ins().fmul(window, spacing);
+        let since = self.ctx.ins().fsub(now, t_prev[0]);
+        let record = self.ctx.ins().fge(since, step);
+
+        let mut t_cur = Vec::with_capacity(depth);
+        let mut v_cur = Vec::with_capacity(depth);
+        for k in 0..depth {
+            let (t_in, v_in) = if k == 0 { (now, input) } else { (t_prev[k - 1], v_prev[k - 1]) };
+            let (t_held, v_held) = (t_prev[k], v_prev[k]);
+            t_cur.push(self.ctx.make_select(record, |_s, b| if b { t_in } else { t_held }));
+            v_cur.push(self.ctx.make_select(record, |_s, b| if b { v_in } else { v_held }));
+        }
+        for (k, &(at, val)) in slots.iter().enumerate() {
+            self.ctx.store_retained(at, t_cur[k]);
+            self.ctx.store_retained(val, v_cur[k]);
+        }
+
+        // -- read the history at t - td ---------------------------------------
+        // The chain is built oldest first so the newest sample that starts at or
+        // before the target wins. A target older than everything recorded reads the
+        // oldest sample, which is both the clause's "output remains at input(0)" at
+        // the start of an analysis and what a `td` that has just grown beyond the
+        // history does: "switching the output back to input(0), since
+        // input(max(t-td,0)) returns 0".
+        //
+        // Only the live pair carries the input, so the derivative of the output with
+        // respect to it is the interpolation weight -- which autodiff works out for
+        // itself, this being ordinary MIR arithmetic rather than a callback.
+        let target = self.ctx.ins().fsub(now, delay);
+        let mut out = v_cur[depth - 1];
+        for k in (0..depth).rev() {
+            let (t_hi, v_hi) = if k == 0 { (now, input) } else { (t_cur[k - 1], v_cur[k - 1]) };
+            let span = self.ctx.ins().fsub(t_hi, t_cur[k]);
+            let spans = self.ctx.ins().fgt(span, F_ZERO);
+            let divisor = self.ctx.make_select(spans, |_s, b| if b { span } else { one });
+            let into = self.ctx.ins().fsub(target, t_cur[k]);
+            let frac = self.ctx.ins().fdiv(into, divisor);
+            let frac = self.ctx.make_select(spans, |_s, b| if b { frac } else { F_ZERO });
+            let rise = self.ctx.ins().fsub(v_hi, v_cur[k]);
+            let travelled = self.ctx.ins().fmul(frac, rise);
+            let val = self.ctx.ins().fadd(v_cur[k], travelled);
+            let inside = self.ctx.ins().fge(target, t_cur[k]);
+            out = self.ctx.make_select(inside, |_s, b| if b { val } else { out });
+        }
+
+        // -- timepoints -------------------------------------------------------
+        // The output is the input shifted, so nothing in the rest of the circuit
+        // tells the solver where its features are: the step is capped at the grid
+        // spacing, which also keeps the recording at that spacing.
+        //
+        // A cap, deliberately, and not a request for a timepoint *on* the next grid
+        // instant the way `timer` and the Z filters ask for their sample instants.
+        // Those consume the instant when they reach it, so what they ask for jumps
+        // forward by a whole period; this grid is relative to the last sample taken,
+        // so landing just short of it would leave a sliver to ask for next, and the
+        // sliver halves until the solver gives up with "timestep too small".
+        //
+        // A delay of zero is a pass-through and needs no help. History is still
+        // recorded there, because a `td` guarded by `maxdelay` may grow again.
+        let delayed = self.ctx.ins().fgt(delay, F_ZERO);
+        let bound = self.ctx.make_select(delayed, |_s, b| if b { step } else { no_bound });
+        self.bound_step(bound);
+
+        out
     }
 
     /// VAMS-2023 4.5.8: the piecewise-linear realization of
