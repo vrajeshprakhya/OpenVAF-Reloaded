@@ -114,31 +114,69 @@ longer computed there.
 ## Tier 1 — accepted but not honoured
 
 The worst category is a model that compiles, behaves differently from what it
-describes, and says nothing about it. One item was in it; it now warns.
+describes, and says nothing about it. Six items have been in it; four are fixed,
+and the two that cannot be now warn.
 
 | Feature | Clause | Status |
 | --- | --- | --- |
 | `$discontinuity(n)`, n >= 0 | 9.17.1 | Still dropped, but **no longer silent**: warns as `ignored_discontinuity` (L019). |
 | Analog variable persistence | 4.5.10, 5.10.2 | Fixed. Retention is granted wherever a read can precede its write. |
-| `@(final_step)` | 5.10.2 | **Silently unconditional.** The body runs at every evaluation, not at the last point. |
+| `@(final_step)` | 5.10.2 | Still unconditional, but **no longer silent**: warns as `unscheduled_event` (L018). Its analysis list is honoured. |
+| `initial_step` ORed with another event | 5.10.1 | Fixed. It contributes its first-evaluation flag instead of leaving the body unconditional. |
+| An analysis list on a global event | 5.10.2 | Fixed. One `analysis()` test per name; the list used to parse and then mean nothing. |
+| A scan target that is not a place | 9.5.4 | Fixed. Rejected now, and an array element at an index the model computes is assigned. |
 
-### `@(final_step)`
+### The global events
 
-Found while implementing 9.5, where it is the natural place to put `$fclose`, and
-where being unconditional is not a harmless approximation: closing the file on the
-first evaluation throws away everything the rest of the run would have written. It
-cost an hour of looking at an empty log.
+Three separate things, all of them in the two sentences 5.10.2 spends on
+`initial_step` and `final_step`. The first two are fixed; the third is the one
+that cannot be.
+
+**An `initial_step` that cancelled what it was ORed with.** 5.10.1's own one-bit
+sampler is `@(initial_step or cross(V(smpl) - 2.5, +1))`, and it did not sample.
+The body of an event control is guarded only if *every* element of the event
+expression carries a runtime condition, and `initial_step` carried none: it was
+special-cased ahead of the loop that collects them, for the case where it is the
+whole expression, and was an element with nothing to offer in every other case.
+So the body ran unconditionally and the sampler tracked its input, and the
+warning the compiler did emit blamed the other half, "'cross' does not schedule an
+event yet", which by then was no longer true of `cross`. It contributes its
+first-evaluation flag from inside the loop now, like everything else.
+
+**An analysis list that was accepted and ignored.** Either global event may name
+the analyses it belongs to, and `@(initial_step("ac"))` is the first point of an ac
+analysis and of nothing else. The list was collected during HIR lowering and then
+read by nobody, which made it exactly as strong as no list at all: an initializer
+meant for one analysis ran in every analysis, and a `final_step("tran")` writing a
+summary file wrote one during the operating point of a dc sweep. In this tree,
+HiSIM2's degradation log is written from a `final_step("tran")`. It is one
+`analysis()` test per name, ORed, ANDed with whatever the event itself contributes.
+
+Which names are worth putting in a list is a separate matter, and the same one
+that cost `above` its first implementation: the flags are not stable across the
+Newton iterations of one step. ngspice reports `ANALYSIS_STATIC` only on the first
+iteration of the initial step and `ANALYSIS_TRAN` on the rest, so a body gated on
+`"static"` runs on one iteration and the iterations after it write the retained
+value back over what it did -- measured, `sim_regression/global_events` counts
+zero. The names that name an *analysis*, `"tran"`, `"ac"`, `"dc"`, `"noise"`, are
+held steady for a whole run and are the ones to use.
+
+**A `final_step` that is every step.** Found while implementing 9.5, where it is
+the natural place to put `$fclose` and where being unconditional is not a harmless
+approximation: closing the file on the first evaluation throws away everything the
+rest of the run would have written. It cost an hour of looking at an empty log.
 
 `@(initial_step)` was made conditional with the variable-persistence work;
-`final_step` was not, and it cannot be in the same way, because nothing tells a
-model which point is the last one. It is the mirror image of the accept callback
-in the table above: the simulator knows, the ABI does not say.
+`final_step` cannot be, because nothing tells a model which point is the last one.
+It is the mirror image of the accept callback in the table above: the simulator
+knows, the ABI does not say. So it warns, under `L018` (`unscheduled_event`), which
+exists for exactly this shape of problem and now covers the global events and not
+only the event functions. Its analysis list does narrow it to the analyses the
+list names, which is as far as the clause can be followed.
 
-The honest interim is to warn, the way `$discontinuity` now does — `L018`
-(`unscheduled_event`) exists for exactly this shape of problem but only covers the
-event *functions*, not the global events. Until then: a file does not need closing
-for its contents to arrive, because the process exits through libc and libc flushes
-what is open. Measured — the `filelog` case closes nothing and loses nothing.
+Nothing needs closing for its contents to arrive, as it happens: the process exits
+through libc and libc flushes what is open. Measured: the `filelog` case closes
+nothing and loses nothing.
 
 `hir_lower/src/expr.rs` handles only `$discontinuity(-1)`, the form that belongs
 with `$limit` (9.17.3); every other degree lowers to nothing, because OSDI has no
@@ -488,10 +526,22 @@ assigning. The same shape as 9.13's seed, which has worked this way since
 `$random`.
 
 Which conversion produces what is settled at compile time from the format, so the
-format of a scan has to be a literal -- the type checker requires one. A target
-that is a variable, or one element of an array named by a constant index, is
-assigned; anything else is accepted by the type checker and then not assigned,
-which is a hole worth closing.
+format of a scan has to be a literal -- the type checker requires one. It also
+requires each target to be something that can be written to, and to be able to
+hold what its conversion produces: `$sscanf(line, "%e", p)` on a parameter, or a
+`%s` into a real variable, used to be accepted and then quietly dropped. The
+conversions and the type check read the format through the same function the
+lowering uses, so the two cannot disagree about which argument receives which
+conversion.
+
+A target is a variable or one element of an array, at any index -- including one
+the model computes, which is written by choosing among the elements exactly as
+`arr[i] = x` is. `sim_regression/vecsrc` scans straight into its arrays because of
+that; before, it counted four records and stored none of them.
+
+The cast between a conversion and its target is the one an assignment would do:
+`$sscanf("8.75", "%d", r)` with a real `r` leaves 8.0 in it, because `%d` says
+what to read out of the text and `r` says what holds it.
 
 `$fscanf` scans a line rather than the file, so a conversion cannot span a line
 break. For a file with one record per line, which is what a vector file is, that
@@ -535,7 +585,8 @@ Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
 `laplace_*` forms
 (4.5.11), `white_noise` / `flicker_noise` / `ac_stim` / `analysis` (4.6),
 `$limit` (9.17.3), `$bound_step` (9.17.2), named events and `->` (5.10.4),
-`initial_step` / `final_step` (5.10.2), `analog initial` (5.2.1), indirect
+`initial_step` (5.10.2, `final_step` with the caveat in Tier 1), `analysis` lists
+on both, `analog initial` (5.2.1), indirect
 contributions (5.6.7), analog user-defined functions (4.7), 1-D arrays, strings
 and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 `$simparam`, `$temperature`, `$vt`, `$abstime`, `$finish` / `$stop` / `$error` /
@@ -572,11 +623,13 @@ tasks (9.5, see above).
 12. ~~**A retained string variable**~~ — done. The slot holds the pointer.
 13. ~~**`$fscanf` / `$sscanf`**~~ — done, with `$fgets`, `$swrite` and
     `$sformat`: the way *in* for a file of vectors.
-14. **Warn on `@(final_step)`** — Tier 1, and a trap rather than a curiosity now
-    that there are files to close. `L018` already exists; it needs to cover the
-    global events.
-15. **Reject a scan target that is not a place** — accepted and then not
-    assigned, which is the silent kind of wrong this page is about.
+14. ~~**Warn on `@(final_step)`**~~ — done, and with it the two deviations
+    probing it turned up: an `initial_step` ORed with another event contributed no
+    condition, and an analysis list on either global event was accepted and
+    ignored. `sim_regression/global_events` measures all three.
+15. ~~**Reject a scan target that is not a place**~~ — done. Rejected if it is
+    not one, assigned if it is: an array element at a computed index now arrives,
+    and the cast to the target's own type is the one an assignment would do.
 16. **`` `default_transition `` / `` `default_discipline ``** — independent,
     small, and immediately visible to model writers.
 17. **Multi-dimensional arrays** — still a parse error on the second subscript.

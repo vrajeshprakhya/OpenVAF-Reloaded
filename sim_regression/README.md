@@ -292,7 +292,10 @@ The other direction from `filelog`: here the file is the *input*, and it is also
 the reference. `vectors.txt` holds four records of "when, what, and a name for
 it"; the model reads them with `$fgets` and `$sscanf` and steps through them with
 `timer`, and the analyzer reads the same file and requires the waveform to be
-what it says.
+what it says. Each record's two numbers are scanned straight into the arrays,
+at an index the loading loop is counting -- which the compiler accepted and then
+did nothing with until the scan targets were fixed, so the model counted four
+records, stored none of them, and the waveform came out flat at 0 V.
 
 ```
 records in the file: 4, loaded by the model: 4

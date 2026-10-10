@@ -329,6 +329,49 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                             .to_owned(),
                     ])
             }
+            BodyValidationDiagnostic::ScanTargetNotAPlace { arg } => {
+                let FileSpan { range, file } = self.expr_src(arg);
+
+                Report::error()
+                    .with_message("a scanned value has nowhere to go".to_owned())
+                    .with_labels(vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: file,
+                        range: range.into(),
+                        message: "cannot be assigned to".to_owned(),
+                    }])
+                    .with_notes(vec![
+                        "VAMS-2023 9.5.4 writes each conversion into the argument that follows \
+                         the format, so an argument that is not a variable, or one element of an \
+                         array, has nothing to receive it"
+                            .to_owned(),
+                        "help: scan into a variable, and read the variable where this stands"
+                            .to_owned(),
+                    ])
+            }
+            BodyValidationDiagnostic::ScanTargetTy { arg, spec, ref produces, ref found } => {
+                let FileSpan { range, file } = self.expr_src(arg);
+
+                Report::error()
+                    .with_message(format!(
+                        "'%{spec}' produces a {produces}, which a {found} variable cannot hold"
+                    ))
+                    .with_labels(vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: file,
+                        range: range.into(),
+                        message: format!("this is a {found}"),
+                    }])
+                    .with_notes(vec![
+                        "VAMS-2023 9.5.4 settles what each conversion produces, and there is no \
+                         conversion between a string and a number"
+                            .to_owned(),
+                        format!(
+                            "help: give this argument a {produces} variable, or change the \
+                             conversion to one that produces a {found}"
+                        ),
+                    ])
+            }
             BodyValidationDiagnostic::WriteToInputArg { expr, arg } => {
                 let FileSpan { range, file } = self.expr_src(expr);
                 let arg_name = arg.name(self.db.upcast());

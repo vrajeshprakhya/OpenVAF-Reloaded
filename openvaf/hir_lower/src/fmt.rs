@@ -44,42 +44,6 @@ pub struct FmtArg {
     pub kind: FmtArgKind,
 }
 
-/// What each conversion in a `$sscanf`/`$fscanf` format produces, in order.
-///
-/// The runtime performs the conversions; this says how to read each result back
-/// and what type to assign. Only the conversions a data file is made of are
-/// recognised, which is the same set the runtime converts.
-pub fn scan_conversions(fmt: &str) -> Vec<Type> {
-    let mut out = Vec::new();
-    let mut chars = fmt.chars();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            continue;
-        }
-        let mut c = match chars.next() {
-            Some(c) => c,
-            None => break,
-        };
-        // A field width belongs to the conversion, not to the count.
-        while c.is_ascii_digit() {
-            c = match chars.next() {
-                Some(c) => c,
-                None => return out,
-            };
-        }
-        match c {
-            '%' => (),
-            'd' | 'D' => out.push(Type::Integer),
-            'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'r' | 'R' => out.push(Type::Real),
-            's' | 'S' => out.push(Type::String),
-            // Anything else stops the scan in the runtime, so it takes no
-            // argument here either.
-            _ => return out,
-        }
-    }
-    out
-}
-
 impl BodyLoweringCtx<'_, '_, '_> {
     pub fn ins_display(&mut self, kind: DisplayKind, newline: bool, args: &[ExprId]) {
         self.ins_fmt(kind, newline, args, None, PrintSink::Log);

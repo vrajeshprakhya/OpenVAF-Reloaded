@@ -693,7 +693,12 @@ impl BodyLoweringCtx<'_, '_, '_> {
     /// Lower `arr[index] = val`. A constant index writes the element place directly;
     /// a runtime index conditionally rewrites every element (`elem_i = (index==i) ?
     /// val : elem_i`), keeping the array in pure SSA.
-    fn assign_array_element(&mut self, var: hir::Variable, index: ExprId, val: mir::Value) {
+    pub(crate) fn assign_array_element(
+        &mut self,
+        var: hir::Variable,
+        index: ExprId,
+        val: mir::Value,
+    ) {
         let len = self.array_len(var);
         if len == 0 {
             return;

@@ -1205,6 +1205,69 @@ fn test_file_scan() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 9.5.4: a scan assigns each conversion to the argument that follows the
+/// format, including to an element of an array the model picks at run time, and with
+/// the cast between what the conversion produces and what the variable holds.
+///
+/// See `scan_target.va`.
+fn test_scan_target() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("scan_target.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_sel: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+            sim.advance_time(1e-6);
+        }
+        sim.set_voltage("sel", v_sel);
+        for node in ["sum", "rout", "mout", "nconv"] {
+            sim.set_voltage(node, 0.0);
+        }
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        (
+            sim.read_residual("flow(sum)").0,
+            sim.read_residual("flow(rout)").0,
+            sim.read_residual("flow(mout)").0,
+            sim.read_residual("flow(nconv)").0,
+        )
+    };
+
+    // Index 0: the two conversions land in tv[0] and tv[1], weighted 1 and 10.
+    let (sum, rout, mout, nconv) = step(&instance, &model, &mut sim, 0.0, true);
+    float_cmp::assert_approx_eq!(f64, sum, 1.5 + 10.0 * 2.5, epsilon = 1e-9);
+    // "8.75" read through a '%d' is 8, and the real variable holds 8.0 rather than
+    // the bits of an integer read back as a double.
+    float_cmp::assert_approx_eq!(f64, rout, 8.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, mout, 3.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nconv, 4.0, epsilon = 1e-9);
+
+    // Index 2, chosen from the port voltage: the same two conversions land in
+    // tv[2] and tv[3] instead, weighted 100 and 1000. A target that is an array
+    // element used to be assigned only when the index was a literal, so this is
+    // the half that silently did nothing.
+    let (sum, _, _, nconv) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, sum, 100.0 * 1.5 + 1000.0 * 2.5, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nconv, 4.0, epsilon = 1e-9);
+
+    // And back, so nothing is left over in the elements that were written before.
+    let (sum, _, _, _) = step(&instance, &model, &mut sim, 0.0, false);
+    float_cmp::assert_approx_eq!(f64, sum, 1.5 + 10.0 * 2.5, epsilon = 1e-9);
+
+    Ok(())
+}
+
 /// VAMS-2023 5.10.2: a global event contributes a condition like any other element
 /// of an event expression, and its analysis list says which analyses it belongs to.
 ///
@@ -2013,5 +2076,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan),Test::new("global_events", &test_global_events)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan),Test::new("global_events", &test_global_events),Test::new("scan_target", &test_scan_target)]
 }

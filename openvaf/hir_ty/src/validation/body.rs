@@ -18,6 +18,7 @@ use crate::builtin::{
 use crate::db::HirTyDB;
 use crate::inference::{BranchWrite, InferenceResult, ResolvedFun};
 use crate::lower::BranchKind;
+use crate::scan::scan_conversions;
 use crate::table_model;
 use crate::types::{Signature, Ty};
 use crate::zi_filter;
@@ -81,6 +82,23 @@ pub enum BodyValidationDiagnostic {
     /// body is at least confined to the analyses it names.
     UnconditionalFinalStep {
         stmt: StmtId,
+    },
+
+    /// VAMS-2023 9.5.4: a scan writes each conversion into an argument, so an
+    /// argument has to name something that can be written to -- a variable, or one
+    /// element of an array.
+    ScanTargetNotAPlace {
+        arg: ExprId,
+    },
+
+    /// VAMS-2023 9.5.4: ... and that variable has to be able to hold what its
+    /// conversion produces. There is no conversion between a string and a number,
+    /// so `%s` into a real variable, or `%e` into a string one, is a type error.
+    ScanTargetTy {
+        arg: ExprId,
+        spec: char,
+        produces: Type,
+        found: Type,
     },
 
     /// VAMS-2023 9.17.1: `$discontinuity(n)` for a non-negative degree is accepted
@@ -783,6 +801,58 @@ impl ExprValidator<'_, '_> {
         }
     }
 
+    /// VAMS-2023 9.5.4: every argument after the format is written to, so every one
+    /// of them has to be writable and has to fit what its conversion produces.
+    ///
+    /// Neither is something a signature can say. The arguments after the format are
+    /// variadic because how many there are, and what each holds, is what the format
+    /// says -- so the format is read here, as the lowering reads it, and the two
+    /// agree because they call the same function.
+    fn validate_scan(&mut self, args: &[ExprId]) {
+        let fmt = match args.get(1).map(|&arg| &self.parent.body.exprs[arg]) {
+            Some(Expr::Literal(Literal::String(fmt))) => fmt.clone(),
+            // Not a literal, which the signature has already rejected.
+            _ => return,
+        };
+
+        for (k, conv) in scan_conversions(&fmt).into_iter().enumerate() {
+            let arg = match args.get(2 + k) {
+                Some(&arg) if self.parent.body.exprs[arg] != Expr::Missing => arg,
+                // Fewer arguments than conversions: the scan stops where they run
+                // out, which is what the clause's return value is for.
+                _ => break,
+            };
+            match self.scan_target_ty(arg) {
+                Some(found) if conv.ty.is_assignable_to(&found) => (),
+                Some(found) => self.report(BodyValidationDiagnostic::ScanTargetTy {
+                    arg,
+                    spec: conv.spec,
+                    produces: conv.ty,
+                    found,
+                }),
+                None => self.report(BodyValidationDiagnostic::ScanTargetNotAPlace { arg }),
+            }
+        }
+    }
+
+    /// What the variable a scan argument names is declared as, or `None` when it
+    /// names no variable: a parameter, a probe, a literal, an expression.
+    fn scan_target_ty(&self, arg: ExprId) -> Option<Type> {
+        if let Expr::Index { base, .. } = self.parent.body.exprs[arg] {
+            // One element of an array variable, whatever the index: an index the
+            // model computes is a place too, written by choosing among the
+            // elements, the same as an ordinary assignment to one.
+            return match self.parent.infer.expr_types[base] {
+                Ty::Var(Type::Array { ref ty, .. }, _) => Some((**ty).clone()),
+                _ => None,
+            };
+        }
+        match self.parent.infer.expr_types[arg] {
+            Ty::Var(ref ty, _) => Some(ty.clone()),
+            _ => None,
+        }
+    }
+
     fn operator_err(&mut self, expr: ExprId, what: &'static str, err: String) {
         self.parent.diagnostics.push(BodyValidationDiagnostic::InvalidOperator { expr, what, err });
     }
@@ -1039,6 +1109,7 @@ impl ExprValidator<'_, '_> {
             BuiltIn::zi_nd | BuiltIn::zi_np | BuiltIn::zi_zd | BuiltIn::zi_zp => {
                 self.validate_zi_filter(expr, call, args)
             }
+            BuiltIn::sscanf | BuiltIn::fscanf => self.validate_scan(args),
             BuiltIn::discontinuity => {
                 // The `$discontinuity(-1)` form is part of `$limit` (9.17.3) and is
                 // lowered; every other degree is dropped, so say so rather than let

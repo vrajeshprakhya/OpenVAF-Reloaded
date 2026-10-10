@@ -891,13 +891,13 @@ impl BodyLoweringCtx<'_, '_, '_> {
             // -- 9.5.3, 9.5.4: the tasks that write back through a string ------
             BuiltIn::swrite | BuiltIn::sformat => {
                 let formatted = self.ins_sformat(&args[1..]);
-                self.assign_out(args[0], formatted);
+                self.assign_out(args[0], formatted, &Type::String);
                 GRAVESTONE
             }
             BuiltIn::fgets => {
                 let desc = self.lower_expr(args[1]);
                 let line = self.ctx.call1(CallBackKind::File(FileOp::Gets), &[desc]);
-                self.assign_out(args[0], line);
+                self.assign_out(args[0], line, &Type::String);
                 // "returns ... the number of characters read", and zero at the end
                 // of the file, which is what an empty line comes back as.
                 self.ctx.call1(CallBackKind::File(FileOp::Len), &[line])
@@ -924,13 +924,13 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 };
                 let fmt = self.lower_expr(args[1]);
                 let count = self.ctx.call1(CallBackKind::File(FileOp::Scan), &[subject, fmt]);
-                for (k, ty) in crate::fmt::scan_conversions(&fmt_lit).into_iter().enumerate() {
+                for (k, conv) in hir::scan::scan_conversions(&fmt_lit).into_iter().enumerate() {
                     let arg = match args.get(2 + k) {
                         Some(&arg) if !self.body.is_missing(arg) => arg,
                         _ => break,
                     };
                     let idx = self.ctx.iconst(k as i32);
-                    let val = match ty {
+                    let val = match conv.ty {
                         Type::String => self.ctx.call1(CallBackKind::File(FileOp::ScanStr), &[idx]),
                         Type::Integer => {
                             let real = self.ctx.call1(CallBackKind::File(FileOp::ScanReal), &[idx]);
@@ -938,7 +938,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
                         }
                         _ => self.ctx.call1(CallBackKind::File(FileOp::ScanReal), &[idx]),
                     };
-                    self.assign_out(arg, val);
+                    self.assign_out(arg, val, &conv.ty);
                 }
                 count
             }
@@ -1605,27 +1605,41 @@ impl BodyLoweringCtx<'_, '_, '_> {
     /// other way to express -- the type checker requires a variable there, so the
     /// argument is a plain read of one and the assignment goes to its place. The
     /// same shape as 9.13's seed.
-    fn assign_out(&mut self, arg: ExprId, val: Value) {
+    fn assign_out(&mut self, arg: ExprId, val: Value, src: &Type) {
         match self.body.try_get_expr(arg) {
             Some(Expr::Read(Ref::Variable(var))) => {
+                let dst = var.ty(self.ctx.db);
+                let val = self.cast_out(val, src, &dst);
                 self.ctx.def_place(PlaceKind::Var(var), val);
             }
-            // One element of an array is a place as well, as long as the index says
-            // which at compile time. A computed index is a choice between elements
-            // when it is read, and no single place when it is written.
+            // One element of an array is a place as well, and so is one the model
+            // picks at run time: `assign_array_element` writes the choice into every
+            // element, exactly as `arr[i] = x` does.
             Some(Expr::Index { base, index }) => {
-                if let (Some(Expr::Read(Ref::Variable(var))), Some(c)) =
-                    (self.body.try_get_expr(base), self.body.as_literalint(&index))
-                {
-                    let lo = var.array_lo(self.ctx.db);
-                    let pos = c as i64 - lo as i64;
-                    if (0..self.array_len(var) as i64).contains(&pos) {
-                        self.ctx.def_place(PlaceKind::VarElement(var, pos as u32), val);
-                    }
+                if let Some(Expr::Read(Ref::Variable(var))) = self.body.try_get_expr(base) {
+                    let dst = match var.ty(self.ctx.db) {
+                        Type::Array { ty, .. } => *ty,
+                        ty => ty,
+                    };
+                    let val = self.cast_out(val, src, &dst);
+                    self.assign_array_element(var, index, val);
                 }
             }
+            // Anything else is rejected during type checking, because a value with
+            // nowhere to go is the silent kind of wrong.
             _ => (),
         }
+    }
+
+    /// The cast from what a conversion produced to what the variable it is going
+    /// into is declared as: `$sscanf(s, "%d", r)` with a real `r` assigns a real,
+    /// the way `r = 1` does. A conversion that produces a string and a target that
+    /// cannot hold one is a type error, not a cast, so nothing is done here.
+    fn cast_out(&mut self, val: Value, src: &Type, dst: &Type) -> Value {
+        if src == dst || !src.is_numeric() || !dst.is_numeric() {
+            return val;
+        }
+        self.ctx.insert_cast(val, src, dst)
     }
 
     /// 9.4.1/9.5.2: `$strobe` and `$fstrobe` write once for the timepoint, not once
