@@ -32,6 +32,7 @@ pub enum TypeValidationDiagnostic {
     MultipleGnds(DuplicateItem<ErasedAstId, NodeId>),
     PortWithoutDirection { decl: ErasedAstId, name: Name },
     NodeWithoutDiscipline { decl: ErasedAstId, name: Name },
+    UnknownDefaultDiscipline { decl: ErasedAstId, name: Name, discipline: Name },
     ExpectedPort { node: NodeId, src: ErasedAstId },
     IncompatibleBranch { branch: BranchId, node1: NodeId, node2: NodeId },
 }
@@ -196,6 +197,34 @@ impl TypeValidationCtx<'_> {
         };
     }
 
+    /// Whether `` `default_discipline `` (VAMS-2023 10.2) supplies the discipline
+    /// a net was declared without, which is the same question
+    /// [`NodeData`](hir_def::NodeData) asks when it resolves one. What the
+    /// directive names still has to be a discipline, and this is where that is
+    /// checked: the directive is read long before any discipline is declared.
+    fn has_default_discipline(&mut self, decl: ErasedAstId, name: &Name) -> bool {
+        let Some(default) =
+            hir_def::directives::default_discipline(self.db.upcast(), self.root_file, decl)
+        else {
+            return false;
+        };
+
+        let discipline = Name::resolve(&default.name);
+        if self
+            .def_map
+            .resolve_local_item_in_scope::<DisciplineId>(self.def_map.root(), &discipline)
+            .is_err()
+        {
+            self.report(TypeValidationDiagnostic::UnknownDefaultDiscipline {
+                decl,
+                name: name.clone(),
+                discipline,
+            })
+        }
+
+        true
+    }
+
     fn verify_node(&mut self, node: NodeId, module: ModuleLoc) {
         let loc = node.lookup(self.db.upcast());
         let node_ = &self.tree[module.id].nodes[loc.id];
@@ -204,10 +233,12 @@ impl TypeValidationCtx<'_> {
                 decl: node_.ast_id,
                 name: node_.name.clone(),
             });
-            self.report(TypeValidationDiagnostic::NodeWithoutDiscipline {
-                decl: node_.ast_id,
-                name: node_.name.clone(),
-            });
+            if !self.has_default_discipline(node_.ast_id, &node_.name) {
+                self.report(TypeValidationDiagnostic::NodeWithoutDiscipline {
+                    decl: node_.ast_id,
+                    name: node_.name.clone(),
+                });
+            }
             return; // Do not print other diagnostics here would just lead to duplications
         }
         let mut directions = node_.decls.iter().filter_map(|decl| {
@@ -261,7 +292,7 @@ impl TypeValidationCtx<'_> {
                     subsequent: duplicates,
                 }))
             }
-        } else {
+        } else if !self.has_default_discipline(node_.ast_id, &node_.name) {
             self.report(TypeValidationDiagnostic::NodeWithoutDiscipline {
                 decl: node_.ast_id,
                 name: node_.name.clone(),

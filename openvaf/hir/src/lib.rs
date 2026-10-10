@@ -162,6 +162,12 @@ impl Module {
         db.module_data(self.id).ports.iter().map(|&id| Node { id }).collect()
     }
 
+    /// The rise and fall time a transition filter in this module gets when it
+    /// specifies neither, from `` `default_transition `` (VAMS-2023 10.3).
+    pub fn default_transition(self, db: &CompilationDB) -> Option<f64> {
+        db.module_data(self.id).default_transition.map(|time| time.0)
+    }
+
     pub fn rec_declarations(self, db: &CompilationDB) -> RecDeclarations<'_> {
         RecDeclarations::new(Scope::Module(self), db)
     }

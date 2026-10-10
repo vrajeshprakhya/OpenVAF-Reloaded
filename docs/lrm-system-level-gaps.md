@@ -424,10 +424,54 @@ compile.
 
 | Feature | Clause | Status |
 | --- | --- | --- |
-| `` `default_discipline `` | 10.2 | Not implemented; fails as ``macro '`default_discipline' has not been declared``. |
-| `` `default_transition `` | 10.3 | Same. Directly relevant here: it sets the default rise/fall for every bare `transition()` in a file, which is exactly how system-level models get written. |
+| `` `default_discipline `` | 10.2 | Implemented. A net declared without a discipline gets the one the directive names, which is what 10.2's own example relies on. |
+| `` `default_transition `` | 10.3 | Implemented. The default rise and fall time of every transition filter that specifies neither, which is exactly how system-level models get written. |
 | Multi-dimensional arrays | 3.x, 4.2.14 | Parse error on the second subscript (`real g[0:1][0:1]`). 1-D arrays work. |
 | `paramset` | 6.x | Parse error: `expected 'discipline', 'nature' or 'module'`. Matters more for device libraries than for system-level work. |
+
+### The directives that supply a default
+
+Neither was accepted and then ignored: an unknown directive is an unknown
+macro, so a file using either failed to compile and nothing was silently
+different. What they needed was a way to reach the code that wants them,
+because a directive is gone before there is a syntax tree. The state one sets
+now travels with the tokens, the way `` `begin_keywords ``'s keyword set
+already did, and is turned back into positions when the tree is built.
+
+`` `default_transition `` is the rise and fall time of a transition filter that
+specifies neither, and 4.5.8 adds "or are equal to zero (0.0)". An unspecified
+time arrives at the lowering as a zero, so both halves of that sentence are one
+test, made in the one place every filter passes through: the Z-transform filters
+(4.5.12) say the same thing about their own transition time and get it from
+there too.
+
+Two readings had to be chosen, and both are worth recording.
+
+**Where the directive may appear.** 10.3 says it "can be used only outside of
+module definitions" and then, one sentence later, that "there are no scope
+restrictions for this directive". The restriction is the sentence that can be
+followed exactly: outside a module, the value in force where a module begins is
+the value in force for every filter the module contains, so there is nothing to
+approximate. Inside one it is an error that says so and says where to move it,
+rather than a value that reaches some filters and not others.
+
+**Which nets a default discipline reaches.** 10.2's qualifiers are the digital
+net and variable types, and Verilog-A has nets of none of them: `wire` itself is
+rejected as an unsupported net type. What it does have is nets declared with no
+net type at all, which are of the default net type, `wire`, so an unqualified
+directive reaches them and so does a `wire`-qualified one, in preference to the
+unqualified one because 10.2 ends with "the more specific directives have higher
+precedence over general directives". Any other qualifier would be in force and
+apply to nothing, and warns instead.
+
+What a directive names still has to be a discipline, and that cannot be checked
+where the directive is read: a directive is processed long before a `discipline`
+declaration is seen, and may name one that an included file declares later. So
+it is checked at the nets that take it, which is also where a model writer can
+see which net the complaint is about.
+
+`` `resetall `` resets both, per 10.2, and is still unimplemented: it warns as
+an unsupported directive, which it did before.
 
 ## A PLL, part by part
 
@@ -452,7 +496,7 @@ write a PLL in this". So, by part, with the state of each measured in
 | Jitter or period logging | `$fstrobe` / `$fdisplay` to a file (9.5) | works; `sim_regression/filelog` checks a jitter sequence the model wrote itself |
 | Stimulus from a file of vectors | `$fgets` and `$sscanf` (9.5.4) | works; `sim_regression/vecsrc` drives a source from a file and checks the waveform against it |
 | Sigma-delta state for fractional-N | multi-dimensional arrays | **missing** for 2-D — Tier 4; a MASH needs only scalar accumulators, so this is a convenience |
-| A bare `transition(x)` with a file-wide edge rate | `` `default_transition `` (10.3) | **missing** — Tier 4 |
+| A bare `transition(x)` with a file-wide edge rate | `` `default_transition `` (10.3) | works; `sim_regression/directives` measures the ramp it sets |
 
 The two realizations of the oscillator are worth the distinction. The
 phase-domain one is the textbook form and it is exact in the sense that matters
@@ -463,9 +507,8 @@ of that, at the cost of sampling the control voltage once per edge rather than
 continuously — which is what a real oscillator does anyway.
 
 So nothing on this page now blocks writing a PLL, measuring one, or driving one
-from a file. What is left in the table above is a convenience
-(`` `default_transition ``), a shape of array nothing here needs, and the two 9.5
-tasks a testbench does not reach for.
+from a file. What is left in the table above is a shape of array nothing here
+needs, and the two 9.5 tasks a testbench does not reach for.
 
 ## 9.5 — files
 
@@ -590,8 +633,8 @@ on both, `analog initial` (5.2.1), indirect
 contributions (5.6.7), analog user-defined functions (4.7), 1-D arrays, strings
 and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 `$simparam`, `$temperature`, `$vt`, `$abstime`, `$finish` / `$stop` / `$error` /
-`$info`, bus ports with `genvar` loops, the display tasks (9.4), and the file
-tasks (9.5, see above).
+`$info`, bus ports with `genvar` loops, the display tasks (9.4), the file
+tasks (9.5, see above), and the compiler directives of 10.2 through 10.6.
 
 ## Suggested order
 
@@ -630,8 +673,9 @@ tasks (9.5, see above).
 15. ~~**Reject a scan target that is not a place**~~ — done. Rejected if it is
     not one, assigned if it is: an array element at a computed index now arrives,
     and the cast to the target's own type is the one an assignment would do.
-16. **`` `default_transition `` / `` `default_discipline ``** — independent,
-    small, and immediately visible to model writers.
+16. ~~**`` `default_transition `` / `` `default_discipline ``**~~ — done. The
+    state a directive sets travels with the tokens, which is what both clauses
+    mean by the text stream that follows the directive.
 17. **Multi-dimensional arrays** — still a parse error on the second subscript.
 18. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
     No longer last on merit: it is what `$fstrobe` needs in order to mean what

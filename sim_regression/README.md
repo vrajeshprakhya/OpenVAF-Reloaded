@@ -29,6 +29,7 @@ timer          PASS
 transition     PASS
 vecsrc         PASS
 global_events  PASS
+directives     PASS
 absdelay       PASS
 filelog        PASS
 pll            PASS
@@ -378,6 +379,42 @@ after it write the retained value back over what it did. This is the same
 instability that cost `above` its first implementation, two sections up. The names
 that name an *analysis* -- "tran", "ac", "dc", "noise" -- are held steady for a
 whole run, and they are the ones to put in a list.
+
+## directives — passing
+
+VAMS-2023 10.3's `` `default_transition ``, with 10.2's `` `default_discipline ``
+underneath it: none of the three outputs below declares a discipline, so the
+device has terminals at all only because the directive gave them one.
+
+The model puts the same bare filter, `transition(x)`, on both sides of the
+directive, which is what "the text stream following the directive" means when the
+stream is one file. Above it there is no default, so 4.5.8's "negligible, but
+non-zero, transition time" applies and the output steps; below it the same text
+ramps over the microsecond the directive names. `zero` is the other half of the
+same sentence, "unspecified **or equal to zero (0.0)**", and `named` writes the
+time out and is what the other two are measured against.
+
+```
+max |v(bare) - v(named)|     : 0.00e+00 V  (tol 1e-09)
+max |v(zero) - v(named)|     : 0.00e+00 V  (tol 1e-09)
+v(bare) rise time 10-90%    : 8.0000e-07 s  (want 8.0000e-07)
+v(zero) rise time 10-90%    : 8.0000e-07 s  (want 8.0000e-07)
+v(named) rise time 10-90%    : 8.0000e-07 s  (want 8.0000e-07)
+v(step) rise time 10-90%     : 2.8000e-10 s  (want < 5e-08)
+```
+
+The rise time is the measurement rather than the value at some instant, because it
+does not depend on when the ramp started: that is a question about the input and
+the solver's grid, while the directive is a question about how long the ramp takes.
+A 1 us ramp spends 800 ns between 10% and 90%, and the three filters below the
+directive agree on every sample of it, not just on its length.
+
+`v(step)` is the control, and the reason the file has two modules: 2.8e-10 s is
+the negligible time resolved on this grid, four orders of magnitude from the ramp
+beside it, from identical model text. It is also what the previous compiler
+produces for all four outputs, when it produces anything: it rejects this file
+outright, with ``macro '`default_transition' has not been declared`` and then
+"no discipline for net 'bare'".
 
 ## filelog — passing
 

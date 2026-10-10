@@ -927,6 +927,32 @@ impl Diagnostic for TypeValidationDiagnosticWrapped<'_> {
                         format!("help: add a discipline with 'electrical {name}'"),
                     ])
             }
+            TypeValidationDiagnostic::UnknownDefaultDiscipline {
+                decl,
+                ref name,
+                ref discipline,
+            } => {
+                let src = self.parse.to_file_span(self.map.get_syntax(decl).range(), self.sm);
+
+                Report::error()
+                    .with_labels(vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: src.file,
+                        range: src.range.into(),
+                        message: format!("'{name}' takes its discipline from the directive"),
+                    }])
+                    .with_message(format!(
+                        "'{discipline}' is not a discipline, and is the default discipline here"
+                    ))
+                    .with_notes(vec![
+                        "info: '`default_discipline' (10.2) names the discipline a net declared \
+                         without one gets"
+                            .to_owned(),
+                        format!(
+                            "help: declare 'discipline {discipline}', or name one that is declared"
+                        ),
+                    ])
+            }
             TypeValidationDiagnostic::IncompatibleBranch { branch, node1, node2 } => {
                 let branch = branch.lookup(self.db.upcast());
                 let branch_range = branch.ast_ptr(self.db.upcast()).range();

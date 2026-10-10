@@ -1741,6 +1741,93 @@ fn test_transition_pwl() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 10.3 and 10.2: the directives that supply a default.
+///
+/// The transition time is the measurable half. 4.5.8 sends a filter that specifies
+/// no rise and fall time, *or specifies zero*, to `` `default_transition ``, and
+/// with no directive in the file to a negligible time -- so a bare filter either
+/// ramps over the 4 s the directive names or steps in one timestep, and nothing in
+/// between. Both forms are compared against the same filter with the time written
+/// out, so the test fails if the default is read as anything other than what the
+/// directive says.
+///
+/// The disciplines are the half that has to hold for the test to run at all: none
+/// of the three outputs is declared with one, so without `` `default_discipline ``
+/// the model does not compile and the terminals this reads by name do not exist.
+fn test_directives() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    // The time the directive names in `directives.va`.
+    const TR: f64 = 4.0;
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("directives.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // One accepted timestep of 1 s, returning the three outputs.
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+        }
+        sim.advance_time(1.0);
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("bare", 0.0);
+        sim.set_voltage("zero", 0.0);
+        sim.set_voltage("named", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        (
+            sim.read_residual("flow(bare)").0,
+            sim.read_residual("flow(zero)").0,
+            sim.read_residual("flow(named)").0,
+        )
+    };
+
+    // t = 1: no history yet, and the input is still 0.
+    let (bare, zero, named) = step(&instance, &model, &mut sim, 0.0, true);
+    for out in [bare, zero, named] {
+        float_cmp::assert_approx_eq!(f64, out, 0.0, epsilon = 1e-9);
+    }
+
+    // t = 2: the input steps to 1 and all three start the same ramp. Each reads the
+    // value "at the point of the interruption", which is 0 for a filter at rest.
+    //
+    // A negligible transition time would put every one of these at 1.0.
+    for n in 0..=4 {
+        let (bare, zero, named) = step(&instance, &model, &mut sim, 1.0, false);
+        let want = f64::from(n) / TR;
+        float_cmp::assert_approx_eq!(f64, bare, want, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, zero, want, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, named, want, epsilon = 1e-9);
+    }
+
+    // t = 7: arrived and clamped, all three together.
+    let (bare, zero, named) = step(&instance, &model, &mut sim, 1.0, false);
+    for out in [bare, zero, named] {
+        float_cmp::assert_approx_eq!(f64, out, 1.0, epsilon = 1e-9);
+    }
+
+    // The fall time is the same number, from the same directive (4.5.8: "if only a
+    // positive rise_time value is specified, the simulator uses it for both").
+    for n in 0..=4 {
+        let (bare, zero, named) = step(&instance, &model, &mut sim, 0.0, false);
+        let want = 1.0 - f64::from(n) / TR;
+        float_cmp::assert_approx_eq!(f64, bare, want, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, zero, want, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, named, want, epsilon = 1e-9);
+    }
+
+    Ok(())
+}
+
 /// VAMS-2023 9.21: `$table_model`, against the table built in Rust.
 ///
 /// The compiled model emits the interpolant as arithmetic over the lookup
@@ -2076,5 +2163,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan),Test::new("global_events", &test_global_events),Test::new("scan_target", &test_scan_target)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan),Test::new("global_events", &test_global_events),Test::new("scan_target", &test_scan_target),Test::new("directives", &test_directives)]
 }

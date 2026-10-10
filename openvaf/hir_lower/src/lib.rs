@@ -613,7 +613,10 @@ impl<'a> MirBuilder<'a> {
 
         let mut ctx = LoweringCtx::new(self.db, builder, !self.lower_equations, &mut interner)
             .with_tagged_vars(self.tagged_reads)
-            .with_absdelay(self.absdelay);
+            .with_absdelay(self.absdelay)
+            // Read off the module rather than configured by the caller: 10.3 is a
+            // property of the source, so every caller wants the same answer.
+            .with_default_transition(self.module.default_transition(self.db));
 
         if self.procedural {
             // Runner lane: lower only the imperative procedural body (all `initial`

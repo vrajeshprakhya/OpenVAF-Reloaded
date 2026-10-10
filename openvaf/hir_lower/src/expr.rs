@@ -1882,6 +1882,18 @@ impl BodyLoweringCtx<'_, '_, '_> {
         self.ctx.make_select(lt, |_s, t| if t { a } else { b })
     }
 
+    /// One of a transition filter's two transition times: the default where the
+    /// model asked for none, and otherwise what it asked for, floored at the
+    /// negligible time that keeps a transition from being instantaneous.
+    ///
+    /// With no `` `default_transition `` in force the two are the same number and
+    /// this is the `max(time, min_ramp)` it has always been.
+    fn transition_time(&mut self, time: Value, default: Value, min_ramp: Value) -> Value {
+        let floored = self.fmax(time, min_ramp);
+        let unspecified = self.ctx.ins().feq(time, F_ZERO);
+        self.ctx.make_select(unspecified, |_s, t| if t { default } else { floored })
+    }
+
     /// `max(a, b)` on reals.
     pub(crate) fn fmax(&mut self, a: Value, b: Value) -> Value {
         let gt = self.ctx.ins().fgt(a, b);
@@ -2157,12 +2169,11 @@ impl BodyLoweringCtx<'_, '_, '_> {
         time_tol: Option<Value>,
     ) -> Value {
         // 4.5.8: with `rise_time`/`fall_time` unspecified or zero they "default to the
-        // value defined by `default_transition"; without that directive -- which this
-        // compiler does not implement -- "a negligible, but non-zero, transition time
-        // is used", because "forcing a zero-duration transition is undesirable" for
-        // convergence. This is that negligible time, and the floor the lag
-        // realization used as its time constant, so a bare `transition(x)` keeps its
-        // character.
+        // value defined by `default_transition"; without that directive "a negligible,
+        // but non-zero, transition time is used", because "forcing a zero-duration
+        // transition is undesirable" for convergence. This is that negligible time,
+        // and the floor the lag realization used as its time constant, so a bare
+        // `transition(x)` in a file with no directive keeps its character.
         const MIN_RAMP: f64 = 1e-12;
         // How many transitions may be in flight through `td` at once. Each slot costs
         // two retained values.
@@ -2173,9 +2184,18 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
         let now = self.ctx.use_param(ParamKind::Abstime);
 
+        // "If neither rise_time nor fall_time are specified or are equal to zero
+        // (0.0), the rise and fall time default to the value defined by
+        // `default_transition." An unspecified one arrives here as a zero, so both
+        // halves of that sentence are the same test, which is why it is made here
+        // rather than where the arguments are read: the Z-transform filters
+        // (4.5.12) pass their own transition time through and the clause says the
+        // same thing about it.
+        let default_ramp = self.ctx.default_transition.unwrap_or(MIN_RAMP);
         let min_ramp = self.ctx.fconst(MIN_RAMP);
-        let rise = self.fmax(rise, min_ramp);
-        let fall = self.fmax(fall, min_ramp);
+        let default_ramp = self.ctx.fconst(default_ramp);
+        let rise = self.transition_time(rise, default_ramp, min_ramp);
+        let fall = self.transition_time(fall, default_ramp, min_ramp);
 
         // The smallest step worth asking for on the way to a corner. Relative to
         // the elapsed time rather than to the step being bounded, so it cannot be

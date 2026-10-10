@@ -40,6 +40,9 @@ pub struct LoweringCtx<'a, 'c> {
     pub function_return: Option<hir::Function>,
     /// How `absdelay` is realized (VAMS-2023 4.5.7). See [`AbsDelayMode`].
     pub absdelay: AbsDelayMode,
+    /// The rise and fall time a transition filter gets when it specifies
+    /// neither, which `` `default_transition `` (4.5.8, 10.3) sets per module.
+    pub default_transition: Option<f64>,
 }
 
 /// CFG targets for the innermost enclosing loop.
@@ -73,6 +76,7 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
             function_exit: None,
             function_return: None,
             absdelay: AbsDelayMode::Simulator,
+            default_transition: None,
         }
     }
 
@@ -83,6 +87,11 @@ impl<'a, 'c> LoweringCtx<'a, 'c> {
 
     pub fn with_absdelay(mut self, mode: AbsDelayMode) -> Self {
         self.absdelay = mode;
+        self
+    }
+
+    pub fn with_default_transition(mut self, time: Option<f64>) -> Self {
+        self.default_transition = time;
         self
     }
 
