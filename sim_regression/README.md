@@ -28,6 +28,7 @@ last_crossing  PASS
 timer          PASS
 transition     PASS
 absdelay       PASS
+filelog        PASS
 pll            PASS
 ```
 
@@ -282,6 +283,57 @@ caps the step at the spacing of its own history grid. In AC at 100 kHz with
 `td = 1 us` the protocol gives exactly −0.628 rad and the in-model realization
 gives none at all; it has no phase to offer, which is the other half of why the
 protocol is the default.
+
+## filelog — passing
+
+The only case here that reads no ngspice output at all. A clock with 20 ns of
+jitter on each half-period logs every period as it completes, with VAMS-2023
+9.5's file tasks, and the analyzer checks the files the *model* wrote. No
+`wrdata`, no edge extraction, no interpolation — which is the point of having
+file output at all.
+
+```
+$fstrobe wrote 9114 lines, $fdisplay 18229
+timepoints attempted and then gone back on: 1325
+periods logged: 100 (n = 1 .. 100)
+worst period against the gap between its edges: 9.001e-18 s
+period: mean 1.007017 us, sd 25.861 ns against 1.000000 us and 28.284 ns, over 99 periods
+both channels of the mcd: 199665 and 199665 bytes, identical: True
+```
+
+Four claims, and each is checked against the file rather than against a
+reference:
+
+**`$fstrobe` and `$fdisplay` write at different times.** 9.4.1 gives `$strobe`
+"the end of the current simulation time" and `$display` whatever moment it is
+reached at, which in an analog block is once per Newton iteration — so the second
+file is twice the length of the first on this netlist, and that ratio is the
+measurement of the difference.
+
+**The file is internally consistent.** Each line carries the edge that closed the
+period and the period itself, so the periods can be checked against each other:
+they agree to 9e-18 s, which is the resolution of `%.12e` at these times. That is
+worth knowing before writing a log — a bare `%e` gives six digits, and on a
+hundred-microsecond timestamp that is a resolution of 1e-10 s, which lost this
+check two orders of magnitude until the format was widened.
+
+**A multichannel descriptor really does write to every channel.**
+`$fstrobe(mcd_a | mcd_b, ...)` leaves two byte-identical files, and both agree
+with what the file-descriptor channel recorded.
+
+**The jitter is the jitter asked for.** Each half-period is an independent draw,
+so the period's standard deviation is `sqrt(2)` times the one in the netlist.
+
+### What a reader of such a log has to know
+
+The time column is not monotone, and 1325 of the 9114 lines here are timepoints
+the solver attempted and then went back on. `$fstrobe` writes once per *attempted*
+timepoint, because that is as close to "the end of the current simulation time"
+as a model can get: OSDI tells it when time has moved, and never tells it that a
+step was accepted. The monotone subsequence is the accepted run. This is the same
+missing accept callback the top of `docs/lrm-system-level-gaps.md` is about, and
+it is the clearest argument for it so far — with it, `$fstrobe` would mean exactly
+what the clause says.
 
 ## pll — passing
 

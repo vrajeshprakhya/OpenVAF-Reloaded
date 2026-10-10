@@ -120,6 +120,25 @@ describes, and says nothing about it. One item was in it; it now warns.
 | --- | --- | --- |
 | `$discontinuity(n)`, n >= 0 | 9.17.1 | Still dropped, but **no longer silent**: warns as `ignored_discontinuity` (L019). |
 | Analog variable persistence | 4.5.10, 5.10.2 | Fixed. Retention is granted wherever a read can precede its write. |
+| `@(final_step)` | 5.10.2 | **Silently unconditional.** The body runs at every evaluation, not at the last point. |
+
+### `@(final_step)`
+
+Found while implementing 9.5, where it is the natural place to put `$fclose`, and
+where being unconditional is not a harmless approximation: closing the file on the
+first evaluation throws away everything the rest of the run would have written. It
+cost an hour of looking at an empty log.
+
+`@(initial_step)` was made conditional with the variable-persistence work;
+`final_step` was not, and it cannot be in the same way, because nothing tells a
+model which point is the last one. It is the mirror image of the accept callback
+in the table above: the simulator knows, the ABI does not say.
+
+The honest interim is to warn, the way `$discontinuity` now does — `L018`
+(`unscheduled_event`) exists for exactly this shape of problem but only covers the
+event *functions*, not the global events. Until then: a file does not need closing
+for its contents to arrive, because the process exits through libc and libc flushes
+what is open. Measured — the `filelog` case closes nothing and loses nothing.
 
 `hir_lower/src/expr.rs` handles only `$discontinuity(-1)`, the form that belongs
 with `$limit` (9.17.3); every other degree lowers to nothing, because OSDI has no
@@ -291,13 +310,15 @@ tighter than before, and the previous compiler fails it at 7.50e-05 V.
 All of these produce `function 'x' is currently not supported by OpenVAF`, from
 the `UNSUPPORTED` list at `sourcegen/src/hir_builtins.rs:29`.
 
-Two entries have left this tier since it was written: the Z-transform filters
-(4.5.12) and `$table_model` (9.21) are implemented. What is left is file I/O and
-four odds and ends.
+Three entries have left this tier since it was written: the Z-transform filters
+(4.5.12), `$table_model` (9.21), and the output side of 9.5. What is left is
+9.5's input side and four odds and ends.
 
 | Feature | Clause | What it blocks |
 | --- | --- | --- |
-| `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fmonitor`, `$fscanf`, `$fgets`, `$sformat`, `$swrite`, `$sscanf`, `$fseek`, `$ftell`, `$feof`, … | 9.5 | File-driven stimulus and result logging — the normal way a system-level testbench gets vectors in and measurements out. |
+| `$fscanf`, `$sscanf` | 9.5.4 | Parsing a line that has been read. Each writes back through a *variable number* of its arguments, which nothing else in the language does; the machinery for writing back through one (`$random`'s seed) exists. |
+| `$fgets`, `$swrite`, `$sformat`, `$ferror` | 9.5.3, 9.5.4, 9.5.7 | Each writes back through one argument, which would work — except that it is a *string* variable, and a string variable that needs retention crashes the compiler today (`unknown cast found Real -> String`, from the retained slot being a double). That is the thing to fix first. |
+| `$fmonitor` | 9.5.2 | Writing when an argument changes, which needs the change detected per argument. |
 | `$simprobe` | 9.16 | Probing another instance's signals. |
 | `$analog_node_alias`, `$analog_port_alias` | 9.20 | Node aliasing. |
 | `$test$plusargs`, `$value$plusargs` | 9.12 | Command-line configuration of a model. |
@@ -391,7 +412,7 @@ write a PLL in this". So, by part, with the state of each measured in
 | Multi-modulus divider | an analog operator per `case` arm | works — it crashed the compiler until the `default`-arm fix above |
 | Phase noise | `noise_table` / `flicker_noise` / `white_noise` (4.6) | works; the table has to be an array literal or a file, not a parameter array |
 | Delay line, DLL | `absdelay` (4.5.7) | works, both realizations — see Tier 0 |
-| Jitter or period logging | `$fdisplay` and friends (9.5) | **missing** — Tier 3 |
+| Jitter or period logging | `$fstrobe` / `$fdisplay` to a file (9.5) | works; `sim_regression/filelog` checks a jitter sequence the model wrote itself |
 | Sigma-delta state for fractional-N | multi-dimensional arrays | **missing** for 2-D — Tier 4; a MASH needs only scalar accumulators, so this is a convenience |
 | A bare `transition(x)` with a file-wide edge rate | `` `default_transition `` (10.3) | **missing** — Tier 4 |
 
@@ -403,9 +424,59 @@ step as jitter. The event-driven one places its own edges and therefore has none
 of that, at the cost of sampling the control voltage once per edge rather than
 continuously — which is what a real oscillator does anyway.
 
-What is left for a PLL is therefore not an operator. It is the testbench: getting
-a measured period or jitter sequence *out* needs 9.5's file tasks, and nothing
-else on this page blocks a model.
+What is left for a PLL is therefore neither an operator nor a way out: a measured
+period or jitter sequence now leaves the model through 9.5's file tasks. What is
+left is the way *in* — a file of vectors needs `$fscanf`, and `$table_model` only
+covers the case where the file is data to interpolate rather than stimulus to
+step through.
+
+## 9.5 — files
+
+Implemented: `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fdebug`,
+`$fflush`, `$ftell`, `$fseek`, `$rewind`, `$feof`. The front end already knew all
+of them — signatures, format-string checking and diagnostics were in place — so
+what was missing was the lowering, a runtime in `openvaf/osdi/stdlib.c`, and three
+decisions the clause does not make for you.
+
+OSDI has nothing to say about files, so the model does it itself: the generated
+library already calls `snprintf` through libc, and `fopen` and friends resolve the
+same way. The descriptor tables live in the library, which is what 9.5.1 describes
+— a descriptor is an integer, so passing one between instances has to mean the
+same file to both.
+
+**A descriptor's kind lives in its value.** 9.5.1 has two of them: `$fopen(name)`
+returns a multichannel descriptor with a single bit set, `$fopen(name, mode)` a
+file descriptor with the top bit set. That is why one integer argument serves every
+output task, and why `$fdisplay(mcd_a | mcd_b, ...)` writes to both files at once.
+Channel 0 of an mcd and the three reserved descriptors are standard input, output
+and error; a model inside a simulator has no business writing to the process's
+stdout, so those route to `osdi_log`, where `$display` already goes.
+
+**`$strobe` and `$fstrobe` now write once per timepoint**, which is 9.4.1's "at the
+end of the current simulation time" read as closely as an analog model can read it.
+Before, `$strobe` was lowered identically to `$display` — once per Newton iteration,
+which for a measurement log is 2x to 20x the lines wanted. The guard is the
+uncommitted half of a retained slot, which is per instance and is written as soon as
+it is assigned, so it distinguishes the first evaluation at a timepoint from the
+iterations that settle it.
+
+It cannot distinguish an *accepted* timepoint from an attempted one, because
+nothing tells it: a step the solver goes back on keeps the line already written for
+it, and the time column goes backwards there. `sim_regression/filelog` measures how
+much of that there is (1325 lines of 9114) and the monotone subsequence is the
+accepted run. This is the best argument on this page for the accept callback at the
+top of it.
+
+**`$fopen` of a file this library already has open returns the same descriptor.**
+5.10.2 puts `@(initial_step)` in force "during the solution of the first point",
+which is every Newton iteration of it, so the one place a model can open a file
+once is a place it is asked to open it several times. Opening it again truncates
+what the earlier iterations wrote and hands out a descriptor nothing holds, until
+the thirty available run out — measured, three opens and two truncations on the
+first timepoint of a three-iteration step. The clause says nothing either way, and
+this is the reading that lets the idiom work. The cost is that a model wanting two
+independent handles on one file gets one, which 9.5 offers no way to ask for
+anyway.
 
 ## Confirmed working
 
@@ -418,7 +489,8 @@ Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
 contributions (5.6.7), analog user-defined functions (4.7), 1-D arrays, strings
 and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 `$simparam`, `$temperature`, `$vt`, `$abstime`, `$finish` / `$stop` / `$error` /
-`$info`, bus ports with `genvar` loops, and the display tasks (9.4).
+`$info`, bus ports with `genvar` loops, the display tasks (9.4), and the output
+side of the file tasks (9.5, see above).
 
 ## Suggested order
 
@@ -444,11 +516,20 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 10. ~~**A `start_time` that changes**~~ — done, with the tolerance floors the
     three step-controlling operators turned out to be missing. A PLL is the
     system that needs it, and `sim_regression/pll` is it.
-11. **File I/O** — now the only thing on this page a PLL testbench is waiting on.
-12. **`` `default_transition `` / `` `default_discipline ``** — independent,
+11. ~~**File I/O, the output side**~~ — done. `$fopen` through `$feof`, with
+    `$strobe` and `$fstrobe` writing once per timepoint instead of once per
+    iteration.
+12. **A retained string variable** — crashes the compiler, and it is what stands
+    between here and `$fgets`, `$swrite`, `$sformat` and `$ferror`. Small, and a
+    crash.
+13. **`$fscanf` / `$sscanf`** — writing back through a variable number of
+    arguments. With 12, this is the way *in* for a file of vectors.
+14. **Warn on `@(final_step)`** — Tier 1, and now a trap rather than a curiosity.
+    `L018` already exists; it needs to cover the global events.
+15. **`` `default_transition `` / `` `default_discipline ``** — independent,
     small, and immediately visible to model writers.
-13. **`$table_model`**, done; **multi-dimensional arrays**, not.
-14. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
-    Deliberately last: it would retire the `$abstime` workaround, give
-    `$discontinuity` something to say, and cost fewer timepoints than capping,
-    but nothing above is waiting on it.
+16. **Multi-dimensional arrays** — still a parse error on the second subscript.
+17. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
+    No longer quite last on merit: it is what `$fstrobe` needs to mean what 9.4.1
+    says, and what would retire the `$abstime` workaround and give
+    `$discontinuity` something to say.

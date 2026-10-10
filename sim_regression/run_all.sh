@@ -107,12 +107,39 @@ run_pll() {
     fi
 }
 
+# The one case with no ngspice output file at all: the model writes its own
+# measurements with 9.5's file tasks, and the analyzer reads those.
+run_filelog() {
+    dir=filelog
+    cd "$here/$dir" || return 1
+    rm -f periods.txt evals.txt both_a.txt both_b.txt
+
+    if ! "$OV" filelog.va -o filelog.osdi >/dev/null 2>&1; then
+        printf '%-14s COMPILE FAILED\n' "$dir"
+        "$OV" filelog.va -o filelog.osdi
+        fail=1
+        return
+    fi
+
+    "$NG" -b filelog.cir > filelog.log 2>&1
+
+    if log=$(python3 "../analyze_filelog.py" 2>&1); then
+        printf '%-14s PASS\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+    else
+        printf '%-14s FAIL\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+        fail=1
+    fi
+}
+
 run sample_hold   sample_hold   sh_out.txt analyze_sample_hold.py
 run above_init    above_init    ai_out.txt analyze_above_init.py
 run last_crossing last_crossing lc_out.txt analyze_last_crossing.py
 run timer         timer         tm_out.txt analyze_timer.py
 run transition    trfilter      tr_out.txt analyze_transition.py
 run_absdelay
+run_filelog
 run_pll
 
 exit $fail
