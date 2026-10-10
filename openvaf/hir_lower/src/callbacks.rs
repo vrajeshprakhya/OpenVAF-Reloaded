@@ -3,7 +3,7 @@ use lasso::Spur;
 use mir::{FunctionSignature, Param};
 use stdx::Ieee64;
 
-use crate::fmt::{DisplayKind, FmtArg};
+use crate::fmt::{DisplayKind, FmtArg, PrintSink};
 use crate::{LimitState, RetainedState};
 
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -68,6 +68,17 @@ pub enum FileOp {
     Tell,
     Seek,
     Rewind,
+    /// `$fgets`, which returns the line rather than writing through its argument.
+    Gets,
+    /// How long that line was, which is what `$fgets` itself returns. Not a file
+    /// operation, but it belongs to the same runtime.
+    Len,
+    /// `$sscanf`: perform the conversions and return how many succeeded. The
+    /// results wait in the runtime for the two below to read back, because a
+    /// Verilog-A argument is not a pointer a runtime can write through.
+    Scan,
+    ScanReal,
+    ScanStr,
 }
 
 impl FileOp {
@@ -82,6 +93,11 @@ impl FileOp {
             FileOp::Tell => "va_ftell",
             FileOp::Seek => "va_fseek",
             FileOp::Rewind => "va_rewind",
+            FileOp::Gets => "va_fgets",
+            FileOp::Len => "va_strlen",
+            FileOp::Scan => "va_sscanf",
+            FileOp::ScanReal => "va_scan_real",
+            FileOp::ScanStr => "va_scan_str",
         }
     }
 
@@ -90,8 +106,15 @@ impl FileOp {
     pub fn num_args(self) -> u16 {
         match self {
             FileOp::OpenMcd => 1,
-            FileOp::Open | FileOp::Flush | FileOp::FlushAll => 2,
-            FileOp::Close | FileOp::Eof | FileOp::Tell | FileOp::Rewind => 1,
+            FileOp::Open | FileOp::Flush | FileOp::FlushAll | FileOp::Scan => 2,
+            FileOp::Close
+            | FileOp::Eof
+            | FileOp::Tell
+            | FileOp::Rewind
+            | FileOp::Gets
+            | FileOp::Len
+            | FileOp::ScanReal
+            | FileOp::ScanStr => 1,
             FileOp::Seek => 3,
         }
     }
@@ -99,10 +122,9 @@ impl FileOp {
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum CallBackKind {
-    /// `to_file` is 9.5's half of 9.4: the same formatting, but the first argument
-    /// is a descriptor and the text goes wherever that names instead of to the
-    /// simulator's log.
-    Print { kind: DisplayKind, to_file: bool, arg_tys: Box<[FmtArg]> },
+    /// 9.4 and 9.5 format alike and differ in where the line goes: `sink` says
+    /// which, and for a file the first argument is the descriptor.
+    Print { kind: DisplayKind, sink: PrintSink, arg_tys: Box<[FmtArg]> },
     File(FileOp),
     /// Whether this is the first evaluation at the current timepoint, which is what
     /// 9.4.1's "at the end of the current simulation time" needs in order not to
@@ -120,6 +142,13 @@ pub enum CallBackKind {
     BuiltinLimit { name: Spur, num_args: u32 },
     StoreLimit(LimitState),
     StoreRetained(RetainedState),
+    /// The same slot, holding a string variable's pointer instead of a number.
+    /// 4.5.10 makes no exception for strings, so neither does retention.
+    StoreRetainedStr(RetainedState),
+    /// What such a slot held at the end of the previous accepted timestep. A
+    /// callback rather than a parameter because the value is a string, which the
+    /// parameter machinery reads as a double.
+    PrevRetainedStr(RetainedState),
     /// The value drawn from a distribution (9.13), given `(seed, a, b)`.
     RngValue(RngDist),
     /// Where that same draw left the seed. Pure, like the value, so the pair can be
@@ -177,11 +206,19 @@ impl CallBackKind {
                 returns: 0,
                 has_sideeffects: true,
             },
-            CallBackKind::Print { kind, to_file, arg_tys: args } => FunctionSignature {
-                name: if *to_file { format!("f{:?})", kind) } else { format!("{:?})", kind) },
+            CallBackKind::Print { kind, sink, arg_tys: args } => FunctionSignature {
+                name: match sink {
+                    PrintSink::Log => format!("{:?})", kind),
+                    PrintSink::File => format!("f{:?})", kind),
+                    PrintSink::Str => "$sformat".to_owned(),
+                },
                 // The format string, plus the descriptor for the file forms.
-                params: args.len() as u16 + 1 + u16::from(*to_file),
-                returns: 0,
+                params: args.len() as u16 + 1 + u16::from(*sink == PrintSink::File),
+                returns: u16::from(*sink == PrintSink::Str),
+                // Pinned in the evaluation even for the string form, which is a pure
+                // function of its arguments: left movable, the pass that hoists
+                // op-independent work into instance setup would take it there and
+                // leave the evaluation reading a value nothing computes.
                 has_sideeffects: true,
             },
             CallBackKind::BuiltinLimit { name, num_args } => FunctionSignature {
@@ -216,6 +253,24 @@ impl CallBackKind {
                 returns: 1,
                 // Opening, closing and seeking a file are the point of calling them,
                 // and the returned status is usually dropped.
+                has_sideeffects: true,
+            },
+            CallBackKind::StoreRetainedStr(state) => FunctionSignature {
+                name: format!("$store_retained_str[{state:?}]"),
+                params: 1,
+                returns: 1,
+                // As for the numeric form: the stored value is read at the start of
+                // the next timestep, not here, so without this the call would be
+                // eliminated and the slot would never be written.
+                has_sideeffects: true,
+            },
+            CallBackKind::PrevRetainedStr(state) => FunctionSignature {
+                name: format!("$retained_prev_str[{state:?}]"),
+                params: 0,
+                returns: 1,
+                // Reading takes no arguments, which would otherwise leave it free to
+                // be hoisted into instance setup, where the slot it reads is not
+                // addressable. Pinned here instead.
                 has_sideeffects: true,
             },
             CallBackKind::RetainedFirst(state) => FunctionSignature {
@@ -299,6 +354,17 @@ impl CallBackKind {
                 | CallBackKind::SimParamOpt
                 | CallBackKind::StoreLimit(_)
                 | CallBackKind::StoreRetained(_)
+                // Reading or writing a retained slot, asking whether this is the
+                // first evaluation at a timepoint, and anything touching a file all
+                // belong to the evaluation. Left op-independent, the pass that moves
+                // such work into instance setup would move them there -- where the
+                // slot a retained callback addresses is not addressable, and where a
+                // line written to a file is written once for the instance instead of
+                // once for the timepoint.
+                | CallBackKind::StoreRetainedStr(_)
+                | CallBackKind::PrevRetainedStr(_)
+                | CallBackKind::RetainedFirst(_)
+                | CallBackKind::File(_)
                 | CallBackKind::RngValue(_)
                 | CallBackKind::RngSeed(_)
                 | CallBackKind::Analysis

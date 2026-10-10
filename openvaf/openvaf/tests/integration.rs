@@ -1120,6 +1120,91 @@ fn test_case_default() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 9.5.3 and 9.5.4: format into a string, read a line back, take it
+/// apart -- and keep a string across a timestep while doing it.
+///
+/// `file_scan.va` writes two records and reads the first one back, so the round
+/// trip is the test and nothing here has to read the file. What the model cannot
+/// check itself is the retention, which needs more than one timepoint: `seen` is
+/// assigned only while the input is high, so its surviving the input going low is
+/// the measurement.
+fn test_file_scan() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let log = std::path::Path::new("openvaf_file_scan_test.txt");
+    let _ = std::fs::remove_file(log);
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("file_scan.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+            sim.advance_time(1.0);
+        }
+        sim.set_voltage("in", v_in);
+        for node in ["a", "b", "nfields", "nchars", "kept"] {
+            sim.set_voltage(node, 0.0);
+        }
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        (
+            sim.read_residual("flow(a)").0,
+            sim.read_residual("flow(b)").0,
+            sim.read_residual("flow(nfields)").0,
+            sim.read_residual("flow(nchars)").0,
+            sim.read_residual("flow(kept)").0,
+        )
+    };
+
+    // t = 0, input low. The record written was "3 1.5 alpha", so reading it back
+    // gives three conversions, and "3 1.5 alpha\n" is twelve characters.
+    let (a, b, nf, nc, kept) = step(&instance, &model, &mut sim, 0.0, true);
+    float_cmp::assert_approx_eq!(f64, a, 3.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, b, 1.5, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nf, 3.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nc, 12.0, epsilon = 1e-9);
+    // Nothing has assigned `seen` yet, and an unassigned string is empty rather
+    // than anything else.
+    float_cmp::assert_approx_eq!(f64, kept, 0.0, epsilon = 1e-9);
+
+    // Input high: `seen` takes the tag the scan produced.
+    let (_, _, _, _, kept) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, kept, 1.0, epsilon = 1e-9);
+
+    // Input low again, and nothing assigns `seen` -- so what it reads is what it
+    // was left holding, which is the whole of 4.5.10 for a string.
+    let (a, b, nf, _, kept) = step(&instance, &model, &mut sim, 0.0, false);
+    float_cmp::assert_approx_eq!(f64, kept, 1.0, epsilon = 1e-9);
+    // And the values parsed at the first point are still the ones in hand.
+    float_cmp::assert_approx_eq!(f64, a, 3.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, b, 1.5, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nf, 3.0, epsilon = 1e-9);
+
+    // The second record is still there to be read, which says the writes went over
+    // the top of each other rather than accumulating: two lines, not six.
+    //
+    // Its leading space is `$write`'s own behaviour here, which `$swrite` inherits:
+    // a value that is not preceded by a format string gets a separator put in front
+    // of it, including when it is the first thing written. Pinned rather than
+    // worked around, because it is what every `$display` in the tree already does.
+    let text = std::fs::read_to_string(log)
+        .unwrap_or_else(|e| panic!("the model did not leave {} behind: {e}", log.display()));
+    let _ = std::fs::remove_file(log);
+    assert_eq!(text.lines().collect::<Vec<_>>(), ["3 1.5 alpha", " 4 2.5 beta"]);
+
+    Ok(())
+}
+
 /// VAMS-2023: analog block variables keep their value between evaluations, so a
 /// read can precede the statement that assigns it and pick up the previous
 /// evaluation's value. See `var_persistence.va` for the three shapes checked here.
@@ -1833,5 +1918,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan)]
 }

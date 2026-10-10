@@ -2,7 +2,7 @@ use std::iter;
 use std::ptr::NonNull;
 
 use hir::CompilationDB;
-use hir_lower::fmt::{DisplayKind, FmtArg, FmtArgKind};
+use hir_lower::fmt::{DisplayKind, FmtArg, FmtArgKind, PrintSink};
 use hir_lower::{CallBackKind, FileOp, HirInterner, RetFlag};
 use lasso::Rodeo;
 use llvm_sys::core::{
@@ -249,6 +249,8 @@ pub fn general_callbacks<'ll>(
                 | CallBackKind::StoreLimit(_)
                 | CallBackKind::StoreRetained(_)
                 | CallBackKind::RetainedFirst(_)
+                | CallBackKind::StoreRetainedStr(_)
+                | CallBackKind::PrevRetainedStr(_)
                 | CallBackKind::RngValue(_)
                 | CallBackKind::RngSeed(_)
                 | CallBackKind::LimDiscontinuity
@@ -258,8 +260,8 @@ pub fn general_callbacks<'ll>(
                 | CallBackKind::FlickerNoise { .. }
                 | CallBackKind::TimeDerivative => return None,
 
-                CallBackKind::Print { kind, to_file, arg_tys } => {
-                    let (fun, fun_ty) = print_callback(builder.cx, *kind, *to_file, arg_tys);
+                CallBackKind::Print { kind, sink, arg_tys } => {
+                    let (fun, fun_ty) = print_callback(builder.cx, *kind, *sink, arg_tys);
                     CallbackFun::Prebuilt(BuiltCallbackFun {
                         fun_ty,
                         fun,
@@ -282,6 +284,11 @@ pub fn general_callbacks<'ll>(
                         FileOp::Open => builder.cx.ty_func(&[ptr, ptr], int),
                         FileOp::Flush | FileOp::FlushAll => builder.cx.ty_func(&[int, int], int),
                         FileOp::Seek => builder.cx.ty_func(&[int, int, int], int),
+                        FileOp::Gets => builder.cx.ty_func(&[int], ptr),
+                        FileOp::Len => builder.cx.ty_func(&[ptr], int),
+                        FileOp::Scan => builder.cx.ty_func(&[ptr, ptr], int),
+                        FileOp::ScanReal => builder.cx.ty_func(&[int], builder.cx.ty_double()),
+                        FileOp::ScanStr => builder.cx.ty_func(&[int], ptr),
                         _ => builder.cx.ty_func(&[int], int),
                     };
                     CallbackFun::Prebuilt(BuiltCallbackFun {
@@ -359,15 +366,19 @@ fn print_module_ir(cx: &CodegenCx, message: &str) {
 }*/
 
 /// The formatting half of 9.4 and 9.5 is the same; only where the line goes
-/// differs. With `to_file` the function takes the descriptor as a second
-/// parameter -- everything after it shifts by one -- and hands the finished line
-/// to `va_fputs` instead of straight to the simulator's log.
+/// differs.
+///
+/// `PrintSink::File` takes the descriptor as a second parameter -- everything
+/// after it shifts by one -- and hands the finished line to `va_fputs` instead of
+/// straight to the simulator's log. `PrintSink::Str` hands it to nobody and
+/// returns it, which is all 9.5.3's `$swrite` and `$sformat` are.
 fn print_callback<'ll>(
     cx: &CodegenCx<'_, 'll>,
     kind: hir_lower::fmt::DisplayKind,
-    to_file: bool,
+    sink: PrintSink,
     arg_tys: &[FmtArg],
 ) -> (&'ll llvm_sys::LLVMValue, &'ll llvm_sys::LLVMType) {
+    let to_file = sink == PrintSink::File;
     // The index of the format string, which is also how far the value arguments
     // move along when a descriptor comes first.
     let fmt_param = if to_file { 2u32 } else { 1u32 };
@@ -377,7 +388,8 @@ fn print_callback<'ll>(
     }
     args.push(cx.ty_ptr());
     args.extend(arg_tys.iter().map(|arg| lltype(&arg.ty, cx)));
-    let fun_ty = cx.ty_func(&args, cx.ty_void());
+    let ret_ty = if sink == PrintSink::Str { cx.ty_ptr() } else { cx.ty_void() };
+    let fun_ty = cx.ty_func(&args, ret_ty);
     let name = cx.local_callback_name();
     let fun = cx.declare_int_fn(&name, fun_ty);
 
@@ -608,7 +620,10 @@ fn print_callback<'ll>(
         let mut incoming_blocks = [write_bb, err_bb];
         LLVMAddIncoming(msg, incoming_values.as_mut_ptr(), incoming_blocks.as_mut_ptr(), 2);
 
-        if to_file {
+        if sink == PrintSink::Str {
+            // Nothing to write it to: the line *is* the result.
+            llvm_sys::core::LLVMBuildRet(llbuilder, msg);
+        } else if to_file {
             // `va_fputs` resolves the descriptor, which may name several files at
             // once or the simulator's own output; the level comes along for the
             // descriptors that mean the latter.
@@ -625,6 +640,7 @@ fn print_callback<'ll>(
                 4,
                 UNNAMED,
             );
+            llvm_sys::core::LLVMBuildRetVoid(llbuilder);
         } else {
             let fun_ptr = cx.get_declared_value("osdi_log").expect("symbol osdi_log is missing");
             let fun_ty = cx.ty_func(&[cx.ty_ptr(), cx.ty_ptr(), cx.ty_int()], cx.ty_void());
@@ -645,8 +661,8 @@ fn print_callback<'ll>(
                 3,
                 UNNAMED,
             );
+            llvm_sys::core::LLVMBuildRetVoid(llbuilder);
         }
-        llvm_sys::core::LLVMBuildRetVoid(llbuilder);
         llvm_sys::core::LLVMDisposeBuilder(llbuilder);
     }
 

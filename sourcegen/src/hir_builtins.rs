@@ -25,22 +25,16 @@ const ANALOG_OPERATORS: [&str; 17] = [
     "transition",
 ];
 
-// What is left of 9.5 after the output side of it: everything here either writes
-// back through an argument (, , , ) or
-// writes back through a variable number of them (, ), and
-//  has to notice its arguments changing.
-const UNSUPPORTED: [&str; 12] = [
+// What is left of 9.5: `$ferror`, whose error codes are implementation-defined
+// and which this runtime has nothing to tell them apart with, and `$fmonitor`,
+// which has to notice its arguments changing.
+const UNSUPPORTED: [&str; 7] = [
     "simprobe",
     "analog_node_alias",
     "analog_port_alias",
     "test_plusargs",
     "value_plusargs",
     "fmonitor",
-    "fgets",
-    "fscanf",
-    "swrite",
-    "sformat",
-    "sscanf",
     "ferror",
 ];
 

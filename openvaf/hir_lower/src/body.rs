@@ -70,9 +70,13 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
         }
     }
 
-    /// Read a retained slot's previous-timestep value (stored as real) back into the
-    /// variable's element type. A real element needs no cast.
+    /// Read a retained slot's previous-timestep value back into the variable's
+    /// element type. A real element needs no cast; a string is not a number at all,
+    /// and goes through the slot as the pointer it is.
     fn retained_load(&mut self, state: crate::RetainedState, elem_ty: &Type) -> Value {
+        if elem_ty == &Type::String {
+            return self.ctx.call1(crate::CallBackKind::PrevRetainedStr(state), &[]);
+        }
         let prev = self.ctx.retained_prev(state);
         match elem_ty {
             Type::Real => prev,
@@ -80,8 +84,12 @@ impl<'c1, 'c2> BodyLoweringCtx<'_, 'c1, 'c2> {
         }
     }
 
-    /// Store a retained slot's final value (cast to real) for the next timestep.
+    /// Store a retained slot's final value for the next timestep.
     fn retained_save(&mut self, state: crate::RetainedState, val: Value, elem_ty: &Type) {
+        if elem_ty == &Type::String {
+            self.ctx.call1(crate::CallBackKind::StoreRetainedStr(state), &[val]);
+            return;
+        }
         let as_real = match elem_ty {
             Type::Real => val,
             _ => self.ctx.insert_cast(val, elem_ty, &Type::Real),

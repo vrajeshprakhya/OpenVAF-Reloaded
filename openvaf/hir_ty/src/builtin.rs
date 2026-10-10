@@ -490,6 +490,23 @@ const FDISPLAY_FUN: BuiltinInfo = BuiltinInfo::varargs(
     &[SignatureData { args: Cow::Borrowed(&[Val(Integer)]), return_ty: Type::Void }],
     true,
 );
+// VAMS-2023 9.5.4. The format has to be a literal, because what each conversion
+// produces is what says how to read its result back and what to assign it to --
+// which the lowering settles, not the runtime.
+const SSCANF: BuiltinInfo = BuiltinInfo::varargs(
+    &[SignatureData {
+        args: Cow::Borrowed(&[Val(Type::String), Literal(Type::String)]),
+        return_ty: Type::Integer,
+    }],
+    true,
+);
+const FSCANF: BuiltinInfo = BuiltinInfo::varargs(
+    &[SignatureData {
+        args: Cow::Borrowed(&[Val(Integer), Literal(Type::String)]),
+        return_ty: Type::Integer,
+    }],
+    true,
+);
 const SWRITE: BuiltinInfo = BuiltinInfo::varargs(
     &[SignatureData { args: Cow::Borrowed(&[Var(String)]), return_ty: Type::Void }],
     true,
@@ -567,8 +584,6 @@ copied_builtins! {
     FMONITOR = FDISPLAY_FUN
     FWRITE = FDISPLAY_FUN
     FDEBUG = FDISPLAY_FUN
-    SSCANF = FDISPLAY_FUN
-    FSCANF = FDISPLAY_FUN
 
     REWIND = BASIC_IO
     FEOF = BASIC_IO

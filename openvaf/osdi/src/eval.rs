@@ -402,6 +402,41 @@ impl<'ll> OsdiCompilationUnit<'_, '_, 'll> {
                         num_state: 0,
                     })
                 }
+                // The string forms of the same slot. Both need the instance in
+                // order to find it, and they take the two halves: writing goes to
+                // the pending one, reading comes from the one a timestep committed.
+                CallBackKind::StoreRetainedStr(state) => {
+                    let fun = builder
+                        .cx
+                        .get_func_by_name("store_retained_str")
+                        .expect("stdlib function store_retained_str is missing");
+                    let fun_ty = cx.ty_func(&[cx.ty_ptr(), cx.ty_ptr()], cx.ty_double());
+                    let ptr = unsafe {
+                        inst_data.retained_pending_ptr(cx, state, instance, builder.llbuilder)
+                    };
+                    CallbackFun::Prebuilt(BuiltCallbackFun {
+                        fun_ty,
+                        fun,
+                        state: Box::new([ptr]),
+                        num_state: 0,
+                    })
+                }
+                CallBackKind::PrevRetainedStr(state) => {
+                    let fun = builder
+                        .cx
+                        .get_func_by_name("retained_prev_str")
+                        .expect("stdlib function retained_prev_str is missing");
+                    let fun_ty = cx.ty_func(&[cx.ty_ptr()], cx.ty_ptr());
+                    let ptr = unsafe {
+                        inst_data.retained_committed_ptr(cx, state, instance, builder.llbuilder)
+                    };
+                    CallbackFun::Prebuilt(BuiltCallbackFun {
+                        fun_ty,
+                        fun,
+                        state: Box::new([ptr]),
+                        num_state: 0,
+                    })
+                }
                 // Shares the cell StoreRetained writes, and for the same reason
                 // needs the instance in order to find it.
                 CallBackKind::RetainedFirst(state) => {

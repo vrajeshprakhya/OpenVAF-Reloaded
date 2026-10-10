@@ -23,6 +23,9 @@ extern void free(void *);
 extern void *fopen(const char *, const char *);
 extern int fclose(void *);
 extern int fputs(const char *, void *);
+extern char *fgets(char *, int, void *);
+extern double strtod(const char *, char **);
+extern long strtol(const char *, char **, int);
 extern int fflush(void *);
 extern int feof(void *);
 extern long ftell(void *);
@@ -372,6 +375,160 @@ int32_t va_fflush(int32_t desc, int32_t all) {
   return 0;
 }
 
+/* 9.5.4: "$fgets reads characters from the file ... until a newline is read and
+ * transferred ... or an EOF condition is encountered", and returns the number of
+ * characters read.
+ *
+ * The line comes back as the return value rather than through the argument,
+ * because a Verilog-A argument is not a place a runtime can write to; the
+ * lowering assigns it, and asks for the length separately. The buffer is exactly
+ * as long as the line, and nothing frees it -- a retained string variable holds
+ * this pointer across a timestep, and so may the next one.
+ */
+char *va_fgets(int32_t desc) {
+  /* IEEE 1364 does not bound a line, so this does. */
+  char line[4096];
+  void *f = va_one_file(desc);
+  size_t len;
+  char *out;
+  if (f == NULL) {
+    return "";
+  }
+  if (fgets(line, (int)sizeof(line), f) == NULL) {
+    return "";
+  }
+  len = strlen(line);
+  out = malloc(len + 1);
+  if (out == NULL) {
+    return "";
+  }
+  memcpy(out, line, len + 1);
+  return out;
+}
+
+/* How much of it there was, which is what the task returns. Separate so that the
+ * read above stays a single call: asking twice would read twice. */
+int32_t va_strlen(const char *s) { return s == NULL ? 0 : (int32_t)strlen(s); }
+
+/* 9.5.4: `$sscanf` and `$fscanf`.
+ *
+ * The conversions are performed here rather than by handing the arguments to
+ * libc's `sscanf`, because what a Verilog-A model passes are variables to be
+ * assigned, not pointers to write through -- there is nothing to hand over. So
+ * each conversion lands in a table that the lowering reads back one entry at a
+ * time, and the count of them comes back as the task's own result.
+ *
+ * What is converted is what a data file is made of: runs of whitespace, literal
+ * characters, `%%`, and `%d`, `%e`/`%f`/`%g`/`%r` and `%s`, with a field width
+ * accepted and ignored. Anything else stops the scan, which is what the clause
+ * says a failing conversion does.
+ */
+#define VA_SCAN_MAX 16
+static double va_scan_nums[VA_SCAN_MAX];
+static char *va_scan_strs[VA_SCAN_MAX];
+
+static int va_isspace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+int32_t va_sscanf(const char *str, const char *fmt) {
+  const char *s = str;
+  const char *f = fmt;
+  int n = 0;
+  if (str == NULL || fmt == NULL) {
+    return -1;
+  }
+  while (*f != '\0') {
+    if (va_isspace(*f)) {
+      while (va_isspace(*s)) {
+        s++;
+      }
+      f++;
+      continue;
+    }
+    if (*f != '%') {
+      if (*s != *f) {
+        break;
+      }
+      s++;
+      f++;
+      continue;
+    }
+    f++;
+    if (*f == '%') {
+      if (*s != '%') {
+        break;
+      }
+      s++;
+      f++;
+      continue;
+    }
+    /* A field width, which the conversions below do not need. */
+    while (*f >= '0' && *f <= '9') {
+      f++;
+    }
+    while (va_isspace(*s)) {
+      s++;
+    }
+    if (*s == '\0' || n >= VA_SCAN_MAX) {
+      break;
+    }
+    if (*f == 'd' || *f == 'D') {
+      char *end;
+      long v = strtol(s, &end, 10);
+      if (end == s) {
+        break;
+      }
+      va_scan_nums[n] = (double)v;
+      s = end;
+    } else if (*f == 'e' || *f == 'E' || *f == 'f' || *f == 'F' || *f == 'g' ||
+               *f == 'G' || *f == 'r' || *f == 'R') {
+      char *end;
+      double v = strtod(s, &end);
+      if (end == s) {
+        break;
+      }
+      va_scan_nums[n] = v;
+      s = end;
+    } else if (*f == 's' || *f == 'S') {
+      const char *start = s;
+      size_t len;
+      char *out;
+      while (*s != '\0' && !va_isspace(*s)) {
+        s++;
+      }
+      len = (size_t)(s - start);
+      out = malloc(len + 1);
+      if (out == NULL) {
+        break;
+      }
+      memcpy(out, start, len);
+      out[len] = '\0';
+      va_scan_strs[n] = out;
+      va_scan_nums[n] = 0.0;
+    } else {
+      break;
+    }
+    n++;
+    f++;
+  }
+  /* "returns EOF if the end of the file is reached": nothing converted and
+   * nothing left to convert. */
+  if (n == 0 && *s == '\0') {
+    return -1;
+  }
+  return (int32_t)n;
+}
+
+double va_scan_real(int32_t k) {
+  return (k >= 0 && k < VA_SCAN_MAX) ? va_scan_nums[k] : 0.0;
+}
+
+char *va_scan_str(int32_t k) {
+  char *s = (k >= 0 && k < VA_SCAN_MAX) ? va_scan_strs[k] : NULL;
+  return s == NULL ? "" : s;
+}
+
 int32_t va_feof(int32_t desc) {
   void *f = va_one_file(desc);
   /* A descriptor that names no file is at its end as much as it is anywhere. */
@@ -703,10 +860,35 @@ double store_retained(double *dst, double val) {
   return val;
 }
 
+/* A string variable that has to survive a timestep.
+ *
+ * 4.5.10 makes no exception for strings: a variable keeps what it held. A
+ * retained slot is eight bytes of instance data, and what goes in it for a
+ * string is the pointer, because that is what a string value is here -- either
+ * into the library's own constants, where it is valid for as long as the library
+ * is loaded, or onto the heap, where nothing in this runtime frees it.
+ *
+ * The slot starts as zero, which reads back as the empty string: the value a
+ * string variable has before anything assigns one.
+ */
+double store_retained_str(double *dst, char *val) {
+  memcpy(dst, &val, sizeof(char *));
+  return 0.0;
+}
+
+char *retained_prev_str(double *src) {
+  char *val;
+  memcpy(&val, src, sizeof(char *));
+  return val == NULL ? "" : val;
+}
+
 void commit_retained(double *vals, double *time, uint32_t num, double abstime) {
   if (abstime > *time) {
     for (uint32_t i = 0; i < num; i++) {
-      vals[2 * i] = vals[2 * i + 1];
+      /* Copied as bytes rather than as a number, because a slot holding a
+       * string holds a pointer, and a pointer is not something arithmetic
+       * should be given the chance to touch. */
+      memcpy(&vals[2 * i], &vals[2 * i + 1], sizeof(double));
     }
   }
   *time = abstime;

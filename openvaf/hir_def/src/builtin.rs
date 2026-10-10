@@ -189,11 +189,6 @@ impl BuiltIn {
             | BuiltIn::test_plusargs
             | BuiltIn::value_plusargs
             | BuiltIn::fmonitor
-            | BuiltIn::fgets
-            | BuiltIn::fscanf
-            | BuiltIn::swrite
-            | BuiltIn::sformat
-            | BuiltIn::sscanf
             | BuiltIn::ferror => true,
             _ => false,
         }

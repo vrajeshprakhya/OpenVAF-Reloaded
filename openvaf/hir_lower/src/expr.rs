@@ -888,6 +888,60 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 };
                 self.ctx.call1(CallBackKind::File(op), &[desc])
             }
+            // -- 9.5.3, 9.5.4: the tasks that write back through a string ------
+            BuiltIn::swrite | BuiltIn::sformat => {
+                let formatted = self.ins_sformat(&args[1..]);
+                self.assign_out(args[0], formatted);
+                GRAVESTONE
+            }
+            BuiltIn::fgets => {
+                let desc = self.lower_expr(args[1]);
+                let line = self.ctx.call1(CallBackKind::File(FileOp::Gets), &[desc]);
+                self.assign_out(args[0], line);
+                // "returns ... the number of characters read", and zero at the end
+                // of the file, which is what an empty line comes back as.
+                self.ctx.call1(CallBackKind::File(FileOp::Len), &[line])
+            }
+            // 9.5.4: the conversions happen in the runtime, which keeps the
+            // results until they are read back one at a time -- an argument here is
+            // a variable to assign, not a pointer to write through.
+            //
+            // `$fscanf` takes a line and scans that, where the clause scans the file
+            // itself: a conversion cannot span a line break. For a file with one
+            // record per line, which is what a vector file is, the two are the same.
+            BuiltIn::sscanf | BuiltIn::fscanf => {
+                let subject = if builtin == BuiltIn::fscanf {
+                    let desc = self.lower_expr(args[0]);
+                    self.ctx.call1(CallBackKind::File(FileOp::Gets), &[desc])
+                } else {
+                    self.lower_expr(args[0])
+                };
+                let fmt_lit = match self.body.as_literal(args[1]) {
+                    Some(Literal::String(lit)) => lit.to_string(),
+                    // The type checker requires a literal here, so this is
+                    // unreachable in a model that compiled.
+                    _ => String::new(),
+                };
+                let fmt = self.lower_expr(args[1]);
+                let count = self.ctx.call1(CallBackKind::File(FileOp::Scan), &[subject, fmt]);
+                for (k, ty) in crate::fmt::scan_conversions(&fmt_lit).into_iter().enumerate() {
+                    let arg = match args.get(2 + k) {
+                        Some(&arg) if !self.body.is_missing(arg) => arg,
+                        _ => break,
+                    };
+                    let idx = self.ctx.iconst(k as i32);
+                    let val = match ty {
+                        Type::String => self.ctx.call1(CallBackKind::File(FileOp::ScanStr), &[idx]),
+                        Type::Integer => {
+                            let real = self.ctx.call1(CallBackKind::File(FileOp::ScanReal), &[idx]);
+                            self.ctx.insert_cast(real, &Type::Real, &Type::Integer)
+                        }
+                        _ => self.ctx.call1(CallBackKind::File(FileOp::ScanReal), &[idx]),
+                    };
+                    self.assign_out(arg, val);
+                }
+                count
+            }
             BuiltIn::fseek => {
                 let desc = self.lower_expr(args[0]);
                 let offset = self.lower_expr(args[1]);
@@ -1543,6 +1597,35 @@ impl BodyLoweringCtx<'_, '_, '_> {
         }
 
         value
+    }
+
+    /// Assign a runtime string to the variable an argument names.
+    ///
+    /// 9.5.3 and 9.5.4 write their result into an argument, which Verilog-A has no
+    /// other way to express -- the type checker requires a variable there, so the
+    /// argument is a plain read of one and the assignment goes to its place. The
+    /// same shape as 9.13's seed.
+    fn assign_out(&mut self, arg: ExprId, val: Value) {
+        match self.body.try_get_expr(arg) {
+            Some(Expr::Read(Ref::Variable(var))) => {
+                self.ctx.def_place(PlaceKind::Var(var), val);
+            }
+            // One element of an array is a place as well, as long as the index says
+            // which at compile time. A computed index is a choice between elements
+            // when it is read, and no single place when it is written.
+            Some(Expr::Index { base, index }) => {
+                if let (Some(Expr::Read(Ref::Variable(var))), Some(c)) =
+                    (self.body.try_get_expr(base), self.body.as_literalint(&index))
+                {
+                    let lo = var.array_lo(self.ctx.db);
+                    let pos = c as i64 - lo as i64;
+                    if (0..self.array_len(var) as i64).contains(&pos) {
+                        self.ctx.def_place(PlaceKind::VarElement(var, pos as u32), val);
+                    }
+                }
+            }
+            _ => (),
+        }
     }
 
     /// 9.4.1/9.5.2: `$strobe` and `$fstrobe` write once for the timepoint, not once

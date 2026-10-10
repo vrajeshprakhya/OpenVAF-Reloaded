@@ -73,6 +73,8 @@ pub fn stub_callbacks<'ll>(
                 | CallBackKind::StoreRetained(_)
                 | CallBackKind::File(_)
                 | CallBackKind::RetainedFirst(_)
+                | CallBackKind::StoreRetainedStr(_)
+                | CallBackKind::PrevRetainedStr(_)
                 | CallBackKind::RngValue(_)
                 | CallBackKind::RngSeed(_)
                 | CallBackKind::LimDiscontinuity
