@@ -28,7 +28,11 @@ last_crossing  PASS
 timer          PASS
 transition     PASS
 absdelay       PASS
+pll            PASS
 ```
+
+`pll` takes longer than all the others together, because it is a closed loop that
+has to settle rather than one operator being measured.
 
 Or one at a time:
 
@@ -278,6 +282,60 @@ caps the step at the spacing of its own history grid. In AC at 100 kHz with
 `td = 1 us` the protocol gives exactly −0.628 rad and the in-model realization
 gives none at all; it has no phase to offer, which is the other half of why the
 protocol is the default.
+
+## pll — passing
+
+The only case here that is a system rather than an operator: a 1 MHz reference, a
+tri-state phase detector and charge pump, an RC loop filter in the netlist, a
+divide-by-four and an oscillator, closed into a loop that has to lock at 4 MHz.
+Nothing in it is a reference waveform; every number is a closed-form consequence
+of the netlist.
+
+```
+reference edge drift from its own grid: 2.711e-19 s
+reference: 119 edges, 1.000000000 MHz, period sd 0.002 ps
+locked 70-120 us: f_vco / f_ref = 3.999905
+static phase error: 0.2141 ns, sd 0.3257 ns
+control voltage: 0.499951 V against 0.500000 V, ripple 0.454 mV
+jittered clock: 118 periods, sd 26.441 ns against 28.284 ns expected
+```
+
+Both clocks and the oscillator are event-driven: each edge's handler names the
+time of the next one, so there is no clock node in the netlist and no period
+written anywhere but in the model. That is what 5.10.3.3's sentence about a
+changing `start_time` is for, and the first line is the measurement of it — the
+k-th reference edge lands within a zeptosecond of k half-periods, measured by the
+model against its own grid rather than by reading the waveform back.
+
+The control voltage is the loop's own arithmetic: the oscillator runs at
+`f0 + kvco * V(ctrl)`, so locking at four times the reference pins `V(ctrl)` at
+`(4 MHz - 3 MHz) / 2 MHz/V` with nothing to tune. The static phase error is what
+makes it a type-II loop: the charge pump drives a capacitor, so the error
+integrates to zero rather than settling at an offset.
+
+The jittered clock drives nothing. It draws each half-period from
+`$rdist_normal`, so its period is the sum of two independent draws and its
+standard deviation is `sqrt(2)` times theirs — which also checks that the seed
+survives across timesteps rather than being re-drawn every Newton iteration.
+
+Two things about this netlist are worth knowing before writing another like it.
+
+**A grid-locked clock and a variable oscillator accumulate differently.** The
+reference computes its next instant from the one it just served
+(`next_edge = next_edge + period/2`) so that an edge taken a tolerance late
+cannot move the grid; the oscillator computes it from the time the edge was
+actually taken (`next_edge = $abstime + 0.5/freq`) so that a late edge cannot put
+the next one in the past, where it would be served immediately and two
+half-periods would cancel into no edge at all. Swapping them is the kind of
+mistake that shows up as a clock that runs slightly fast, or one that stops.
+
+**A detector that pumps all the time has a ripple it cannot get rid of.** The
+first version of this netlist used a detector that held the pump in one direction
+or the other at all times, and its control ripple works out to `zeta * N * wn` in
+frequency however the filter is scaled — 6% of the carrier here, which the
+oscillator then samples at its own edges, and the loop hunted instead of locking.
+The tri-state detector stops pumping once the edges line up, which is what takes
+the ripple to 0.45 mV and what the reset path in a real PFD is for.
 
 ## Why retained state does not live in the OSDI state array
 

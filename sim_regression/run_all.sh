@@ -79,11 +79,40 @@ run_absdelay() {
     fi
 }
 
+# The PLL is the one case that is a whole system rather than one operator: a
+# reference that schedules its own edges, a phase detector on `cross`, a charge
+# pump, a divider and an oscillator, closed into a loop that has to lock. It takes
+# longer than the rest of the suite together and its numbers are worth reading
+# whether or not it passed, so they are always printed.
+run_pll() {
+    dir=pll
+    cd "$here/$dir" || return 1
+
+    if ! "$OV" pll.va -o pll.osdi >/dev/null 2>&1; then
+        printf '%-14s COMPILE FAILED\n' "$dir"
+        "$OV" pll.va -o pll.osdi
+        fail=1
+        return
+    fi
+
+    "$NG" -b pll.cir > pll.log 2>&1
+
+    if log=$(python3 "../analyze_pll.py" 2>&1); then
+        printf '%-14s PASS\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+    else
+        printf '%-14s FAIL\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+        fail=1
+    fi
+}
+
 run sample_hold   sample_hold   sh_out.txt analyze_sample_hold.py
 run above_init    above_init    ai_out.txt analyze_above_init.py
 run last_crossing last_crossing lc_out.txt analyze_last_crossing.py
 run timer         timer         tm_out.txt analyze_timer.py
 run transition    trfilter      tr_out.txt analyze_transition.py
 run_absdelay
+run_pll
 
 exit $fail

@@ -206,12 +206,58 @@ clock node anywhere in the netlist: all five event instants land exactly, the
 held values are exact to 0.00e+00 V, and exactly five events fire — no
 double-firing across the Newton iterations of the step an event lands on.
 
-That is also why `time_tol` is accepted and then ignored. 5.10.3.3 asks the
-simulator to place a point "within time_tol of an event"; placing it exactly on
-the event satisfies any tolerance. One deviation worth recording: the LRM says a
-`start_time` that changes mid-simulation reschedules the next event, and this
-reads `start_time` only while nothing is scheduled yet. `period` is re-read every
-evaluation, so a changing period does follow the clause.
+### A start_time that changes
+
+5.10.3.3: "If the start_time or period expressions change value during the
+evaluation of the analog block, the next event will be scheduled based on the
+latest value of the start_time and period." `period` was re-read every evaluation
+and so already followed that; `start_time` was read once and kept, which was
+recorded here as a deviation. It is the deviation that matters most of the three
+tiers below, because that sentence is what lets an event schedule its own
+successor:
+
+```verilog
+@(timer(next_edge)) begin
+    state = !state;
+    next_edge = $abstime + half + $rdist_normal(seed, 0.0, jitter);
+end
+```
+
+That is a clock source with a per-cycle period — a DCO, a spread-spectrum source,
+a divider that stretches one cycle, anything with jitter on it — and it is how a
+PLL gets a reference and an oscillator without a clock node in the netlist. With
+`start_time` read once it fired at t = 0 and then stood still for ever: measured,
+0 edges in 10 us where there should have been 10. A second retained slot now holds
+the value the live schedule was built from, and a different one reschedules.
+
+`sim_regression/pll` is the system built on it, and the measurement of the
+placement is the model's own: the k-th reference edge lands within 3e-19 s of k
+half-periods.
+
+### time_tol, which is no longer accepted and ignored
+
+5.10.3.3 asks the simulator to place a point "within time_tol of an event", and
+the note here used to be that placing it exactly on the event satisfies any
+tolerance. That is true of a `start_time` that does not move. It is not true of
+one the model computes, where the instant asked for is a running sum of intervals
+and the simulator's time a running sum of steps: the two can disagree in their
+last bits, and an instant missed by its last bit is an instant still ahead, so
+the event does not fire and the cap asks for the attosecond in between — and then
+for the one in between that, until the solver gives up with "timestep too small".
+
+`time_tol` now opens the firing window on the early side and floors the step
+asked for, and with none given the tool picks one, as the clause allows: a part in
+1e12 of the instant itself. The same hole was in `transition`, which asked for a
+timepoint on each corner of a ramp until it got one and could ask for a
+femtosecond for ever, and in `cross`, whose default tolerance is a thousandth of
+the step being taken and so followed that step down by a factor of a thousand per
+evaluation. Both now have a floor that does not depend on the step it is
+bounding.
+
+None of the three is exotic. All of them were found in one netlist, by two
+clocks and a divider: a divider output caught half way up its own transition ramp
+is sitting exactly on a phase detector's switching point, and an oscillator edge
+that coincides with a reference edge is what a locked PLL does every cycle.
 
 `absdelta` is worth a scoping decision rather than an implementation. 5.10.3.4
 says it "is only allowed in an initial or always block of a Verilog-AMS module":
@@ -245,10 +291,12 @@ tighter than before, and the previous compiler fails it at 7.50e-05 V.
 All of these produce `function 'x' is currently not supported by OpenVAF`, from
 the `UNSUPPORTED` list at `sourcegen/src/hir_builtins.rs:29`.
 
+Two entries have left this tier since it was written: the Z-transform filters
+(4.5.12) and `$table_model` (9.21) are implemented. What is left is file I/O and
+four odds and ends.
+
 | Feature | Clause | What it blocks |
 | --- | --- | --- |
-| `zi_nd`, `zi_np`, `zi_zd`, `zi_zp` | 4.5.12 | Linear discrete-time filters. Sampled-data systems, digital filter models, sigma-delta modulators, any DSP chain. A unity Z-filter is a sample-and-hold with period T. |
-| `$table_model` | 9.21 | Data-driven behavioral models from swept or measured data. Not merely unsupported: the name is commented out of the sysfun list (`hir_builtins.rs:207`), so it does not resolve at all. |
 | `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fmonitor`, `$fscanf`, `$fgets`, `$sformat`, `$swrite`, `$sscanf`, `$fseek`, `$ftell`, `$feof`, … | 9.5 | File-driven stimulus and result logging — the normal way a system-level testbench gets vectors in and measurements out. |
 | `$simprobe` | 9.16 | Probing another instance's signals. |
 | `$analog_node_alias`, `$analog_port_alias` | 9.20 | Node aliasing. |
@@ -287,8 +335,7 @@ functions, 34 draws, values and advanced seeds alike, in
 
 ### Found while testing: `case` arms and analog operators
 
-Two analog operators in different arms of a `case` statement crash the compiler.
-`transition()` trips it as readily as the distributions do, and predates them:
+Fixed. An analog operator in the `default` arm of a `case` crashed the compiler:
 
 ```verilog
 case (kind)
@@ -297,9 +344,23 @@ case (kind)
 endcase
 ```
 
-The same pair written as `if`/`else` compiles and runs. Not in Tier 1 because it
-is a crash rather than a wrong answer, but it is the kind of thing a model writer
-hits without warning.
+```
+internal error: entered unreachable code: attempted to read undefined value
+```
+
+The same pair written as `if`/`else` always compiled, and so did two numbered
+arms; it was the `default` arm specifically, because that one is lowered into the
+block the last condition falls through to and that block was still open. An open
+block answers a variable read with a placeholder phi to be filled in when it is
+sealed, so a body that branches — any analog operator with a select in it — read
+through the placeholder from a successor block, which is no longer the one that
+gets filled, and the value reached codegen undefined. Each arm above it is lowered
+into a block that is sealed first, deliberately, for exactly this reason.
+
+A multi-modulus divider or a mode-switched buffer is the natural way to hit it.
+`openvaf/test_data/osdi/case_default.va` builds the same choice twice, once each
+way, and the integration test requires the two to agree rather than merely to
+compile.
 
 ## Tier 4 — language and grammar
 
@@ -309,6 +370,42 @@ hits without warning.
 | `` `default_transition `` | 10.3 | Same. Directly relevant here: it sets the default rise/fall for every bare `transition()` in a file, which is exactly how system-level models get written. |
 | Multi-dimensional arrays | 3.x, 4.2.14 | Parse error on the second subscript (`real g[0:1][0:1]`). 1-D arrays work. |
 | `paramset` | 6.x | Parse error: `expected 'discipline', 'nature' or 'module'`. Matters more for device libraries than for system-level work. |
+
+## A PLL, part by part
+
+The page is organized by clause, which is the wrong shape for answering "can I
+write a PLL in this". So, by part, with the state of each measured in
+`sim_regression/pll` unless noted:
+
+| Part | Written with | State |
+| --- | --- | --- |
+| Reference clock | `@(timer(next_edge))` rescheduling itself, `transition` for the edge | works; edges on their grid to 3e-19 s |
+| Jitter | `$rdist_normal` on each half-period | works; sd within sampling error of `sqrt(2)` times the spec |
+| Phase/frequency detector | `@(cross(V(ref) - vth, +1))`, arms cleared when both are up | works; `cross` steers the step onto each edge |
+| Phase error as a number | `last_crossing` (4.5.10) | works; crossing times exact to 0.00e+00 s in `sim_regression/last_crossing` |
+| Charge pump | `I(ctrl) <+ -transition(icp * (up - dn), 0, tr)` | works |
+| Loop filter | RC in the netlist, or `laplace_nd`/`laplace_zp` (4.5.11) | works |
+| Oscillator, event-driven | `@(timer)` with the period recomputed per edge | works; period exact, and the control voltage settles where the arithmetic says |
+| Oscillator, phase-domain | `idtmod(freq, 0, 1, 0)` and a threshold | works, but nothing steers the timestep onto the wrap, so the edge lands where the solver stepped |
+| Divider | `@(cross)` counting, `transition` on the output | works; exactly one output edge per `ndiv` input edges |
+| Multi-modulus divider | an analog operator per `case` arm | works — it crashed the compiler until the `default`-arm fix above |
+| Phase noise | `noise_table` / `flicker_noise` / `white_noise` (4.6) | works; the table has to be an array literal or a file, not a parameter array |
+| Delay line, DLL | `absdelay` (4.5.7) | works, both realizations — see Tier 0 |
+| Jitter or period logging | `$fdisplay` and friends (9.5) | **missing** — Tier 3 |
+| Sigma-delta state for fractional-N | multi-dimensional arrays | **missing** for 2-D — Tier 4; a MASH needs only scalar accumulators, so this is a convenience |
+| A bare `transition(x)` with a file-wide edge rate | `` `default_transition `` (10.3) | **missing** — Tier 4 |
+
+The two realizations of the oscillator are worth the distinction. The
+phase-domain one is the textbook form and it is exact in the sense that matters
+for a large-signal sweep, but its output edge is a threshold crossing of a
+sawtooth that nothing asks the solver to resolve, so the edge carries the solver's
+step as jitter. The event-driven one places its own edges and therefore has none
+of that, at the cost of sampling the control voltage once per edge rather than
+continuously — which is what a real oscillator does anyway.
+
+What is left for a PLL is therefore not an operator. It is the testbench: getting
+a measured period or jitter sequence *out* needs 9.5's file tasks, and nothing
+else on this page blocks a model.
 
 ## Confirmed working
 
@@ -341,12 +438,17 @@ and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
    the extrapolated crossing; the sample-and-hold residual is now 0.00e+00 V.
 7. ~~**`$random` / `$dist_*`**~~ — done. All eight functions, verified against
    the stream IEEE 1364 17.9.3 specifies.
-8. **Z-transform filters** — retained state plus T-periodic sampling plus
-   `transition`, so largely a composition of 3, 5 and what already exists.
-9. **`` `default_transition `` / `` `default_discipline ``** — independent,
-   small, and immediately visible to model writers.
-10. **`$table_model`, then file I/O** — the two largest self-contained items.
-11. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
+8. ~~**Z-transform filters**~~ — done. Retained state plus T-periodic sampling
+   plus `transition`, so largely a composition of 3, 5 and what already existed.
+9. ~~**`absdelay` without a simulator**~~ — done, both realizations; see Tier 0.
+10. ~~**A `start_time` that changes**~~ — done, with the tolerance floors the
+    three step-controlling operators turned out to be missing. A PLL is the
+    system that needs it, and `sim_regression/pll` is it.
+11. **File I/O** — now the only thing on this page a PLL testbench is waiting on.
+12. **`` `default_transition `` / `` `default_discipline ``** — independent,
+    small, and immediately visible to model writers.
+13. **`$table_model`**, done; **multi-dimensional arrays**, not.
+14. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
     Deliberately last: it would retire the `$abstime` workaround, give
     `$discontinuity` something to say, and cost fewer timepoints than capping,
     but nothing above is waiting on it.
