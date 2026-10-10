@@ -870,6 +870,180 @@ fn test_timer_detect() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 5.10.3.3: "If the start_time or period expressions change value
+/// during the evaluation of the analog block, the next event will be scheduled
+/// based on the latest value of the start_time and period."
+///
+/// `timer_resched.va` is the shape that sentence exists for: the handler of each
+/// event names the time of the next one, so the operator is a clock source rather
+/// than a fixed grid. A `timer` that read its start_time once would fire at t = 0
+/// and then never again, which is what it did.
+fn test_timer_resched() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    // One accepted timestep of 1 s -- whole seconds, so no sum of steps and no sum
+    // of intervals can land a fraction of an ulp apart and make this test about
+    // floating point instead of about scheduling. The input is the step number, so
+    // the value held at an event names the step the event fired on.
+    let run = |interval: f64, tol: f64| -> Result<Vec<(f64, f64, f64)>> {
+        let desc = test_descriptor(&openvaf_test_data("osdi").join("timer_resched.va"))?;
+        let model = desc.new_model();
+        // Parameter order is $mfactor, interval, tol -- see timer_resched.snap.
+        model.set_real_param(1, interval);
+        model.set_real_param(2, tol);
+        model.process_params()?;
+        let mut instance = model.new_instance();
+        let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+        let mut out = Vec::new();
+        for step in 0..11 {
+            if step != 0 {
+                sim.next_iter();
+                sim.advance_time(1.0);
+            }
+            sim.set_voltage("in", step as f64);
+            sim.set_voltage("held", 0.0);
+            sim.set_voltage("count", 0.0);
+            sim.set_voltage("clk", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+            out.push((
+                sim.read_residual("flow(held)").0,
+                sim.read_residual("flow(count)").0,
+                sim.read_residual("flow(clk)").0,
+            ));
+        }
+        Ok(out)
+    };
+
+    let check = |got: &[(f64, f64, f64)], want: &[(f64, f64, f64)]| {
+        for (got, want) in got.iter().zip(want) {
+            float_cmp::assert_approx_eq!(f64, got.0, want.0, epsilon = 1e-9);
+            float_cmp::assert_approx_eq!(f64, got.1, want.1, epsilon = 1e-9);
+            float_cmp::assert_approx_eq!(f64, got.2, want.2, epsilon = 1e-9);
+        }
+    };
+
+    // Events at 0, 3, 6 and 9 s: the first from the initial start_time of zero,
+    // every one after it from the time the previous handler asked for. The held
+    // sample is the step index, so it also pins *which* step each event landed on,
+    // and `clk` toggling every event is the clock a divider would count.
+    //
+    // Before the start_time was re-read, this fired once at t = 0 and the rest of
+    // the column stayed at (0, 1, 1) for ever.
+    check(
+        &run(3.0, 0.0)?,
+        &[
+            (0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (3.0, 2.0, 0.0),
+            (3.0, 2.0, 0.0),
+            (3.0, 2.0, 0.0),
+            (6.0, 3.0, 1.0),
+            (6.0, 3.0, 1.0),
+            (6.0, 3.0, 1.0),
+            (9.0, 4.0, 0.0),
+            (9.0, 4.0, 0.0),
+        ],
+    );
+
+    // An interval that does not divide the step grid, with the window closed: each
+    // event is taken at the first step at or past its instant, which is the clause's
+    // default of "at, or just beyond, the time of the event". 3.1 is due at 3.1 and
+    // taken at 4, so the schedule walks: 0, 4, 8, and 11.1 never arrives.
+    let late = run(3.1, 0.0)?;
+    check(
+        &late,
+        &[
+            (0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (4.0, 2.0, 0.0),
+            (4.0, 2.0, 0.0),
+            (4.0, 2.0, 0.0),
+            (4.0, 2.0, 0.0),
+            (8.0, 3.0, 1.0),
+            (8.0, 3.0, 1.0),
+            (8.0, 3.0, 1.0),
+        ],
+    );
+
+    // The same interval with a `time_tol` of 0.2 s: "the analog simulator places a
+    // time point within time_tol of an event", so the step at 3 is within tolerance
+    // of the instant at 3.1 and takes it. The cadence stops walking and the count
+    // comes back to four.
+    let in_tol = run(3.1, 0.2)?;
+    check(&in_tol, &run(3.0, 0.0)?);
+    assert_eq!(in_tol.last().unwrap().1 as usize, 4);
+    assert_eq!(late.last().unwrap().1 as usize, 3);
+
+    Ok(())
+}
+
+/// An analog operator in the `default` arm of a `case` used to crash the compiler
+/// ("attempted to read undefined value"), because the default arm is lowered into
+/// the still-open block the last condition falls through to. `case_default.va`
+/// builds the same choice twice, once with `case` and once with the `if`/`else`
+/// that always worked, and the two have to agree.
+fn test_case_default() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    const TR: f64 = 4.0;
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("case_default.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let mut step = |instance: &OsdiInstance,
+                    model: &OsdiModel,
+                    sim: &mut MockSimulation,
+                    v_in: f64,
+                    first: bool| {
+        if !first {
+            sim.next_iter();
+        }
+        sim.advance_time(1.0);
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("viacase", 0.0);
+        sim.set_voltage("viaif", 0.0);
+        instance.eval(model, sim, EvalFlags::empty());
+        instance.load_dae(model, sim);
+        (sim.read_residual("flow(viacase)").0, sim.read_residual("flow(viaif)").0)
+    };
+
+    // t = 1: the first evaluation passes the input straight through.
+    let (c, i) = step(&instance, &model, &mut sim, 0.0, true);
+    float_cmp::assert_approx_eq!(f64, c, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, i, 0.0, epsilon = 1e-9);
+
+    // t = 2: the input steps to 1, and both arms start the same 4 s ramp.
+    let (c, i) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, c, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, i, 0.0, epsilon = 1e-9);
+
+    // t = 3..6: 1/TR per second in both, arriving at 1.0 together.
+    for n in 1..=4 {
+        let (c, i) = step(&instance, &model, &mut sim, 1.0, false);
+        float_cmp::assert_approx_eq!(f64, c, f64::from(n) / TR, epsilon = 1e-9);
+        float_cmp::assert_approx_eq!(f64, i, f64::from(n) / TR, epsilon = 1e-9);
+    }
+
+    // And clamped at the destination rather than creeping past it.
+    let (c, i) = step(&instance, &model, &mut sim, 1.0, false);
+    float_cmp::assert_approx_eq!(f64, c, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, i, 1.0, epsilon = 1e-9);
+
+    Ok(())
+}
+
 /// VAMS-2023: analog block variables keep their value between evaluations, so a
 /// read can precede the statement that assigns it and pick up the previous
 /// evaluation's value. See `var_persistence.va` for the three shapes checked here.
@@ -1583,5 +1757,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default)]
 }

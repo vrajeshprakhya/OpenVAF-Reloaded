@@ -1650,7 +1650,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
         // The output is the newest sample, held until the next one, ramped over
         // `tau`. No delay: a unity filter "exhibits no delay".
         let held = self.ctx.make_select(reached, |_s, b| if b { acc } else { y_prev[0] });
-        self.emit_transition(held, F_ZERO, tau, tau)
+        self.emit_transition(held, F_ZERO, tau, tau, None)
     }
 
     /// `val * coeff` with the constant folded away where it is 0 or 1.
@@ -1672,7 +1672,7 @@ impl BodyLoweringCtx<'_, '_, '_> {
     }
 
     /// `max(a, b)` on reals.
-    fn fmax(&mut self, a: Value, b: Value) -> Value {
+    pub(crate) fn fmax(&mut self, a: Value, b: Value) -> Value {
         let gt = self.ctx.ins().fgt(a, b);
         self.ctx.make_select(gt, |_s, t| if t { a } else { b })
     }
@@ -1905,9 +1905,20 @@ impl BodyLoweringCtx<'_, '_, '_> {
     /// negligible default, which is the clause's own exemption: forcing it "would
     /// result in poor performance".
     ///
-    /// That is also why `time_tol` is accepted and then not used. It asks for a point
-    /// within `time_tol` of a corner, and landing on the corner exactly satisfies any
-    /// tolerance -- the same reasoning `timer` is lowered with.
+    /// `time_tol` is how near the corner the point has to land, which here is a
+    /// floor under the step asked for rather than a reason not to ask: the whole
+    /// value of the request is that the point lands *on* the corner, so the distance
+    /// to it is what gets requested until it is zero.
+    ///
+    /// The floor is what keeps that from running away. "The instant the ramp
+    /// arrives" and "the time the solver reached" are two different sums of the same
+    /// quantities, so they can disagree in their last bits, and then the operator
+    /// asks for the femtosecond in between, and then for the one in between that,
+    /// until the timestep is 2e-22 s and ngspice gives up with "timestep too small"
+    /// -- which is how a PLL whose phase detector sees two edges a hair apart used
+    /// to end. With no `time_tol` given the default is a part in 1e9 of the elapsed
+    /// time: a step the solver can still take, and an overshoot too small to see in
+    /// a waveform that reaches its corner in nanoseconds.
     ///
     /// What stays step-dependent is *when a change is noticed*: `expr` steps, so
     /// there is no crossing to interpolate. In practice the change is driven by a
@@ -1919,13 +1930,21 @@ impl BodyLoweringCtx<'_, '_, '_> {
         // "If only a positive rise_time value is specified, the simulator uses it for
         // both rise and fall times."
         let fall = self.opt_arg(args, 3).unwrap_or(rise);
-        self.emit_transition(target, td, rise, fall)
+        let tol = self.opt_arg(args, 4);
+        self.emit_transition(target, td, rise, fall, tol)
     }
 
     /// The transition machinery itself, which 4.5.12's Z-transform filters share:
     /// the clause describes their output in the same terms, down to not resolving
     /// the trailing corner when the transition time is the default.
-    fn emit_transition(&mut self, target: Value, td: Value, rise: Value, fall: Value) -> Value {
+    fn emit_transition(
+        &mut self,
+        target: Value,
+        td: Value,
+        rise: Value,
+        fall: Value,
+        time_tol: Option<Value>,
+    ) -> Value {
         // 4.5.8: with `rise_time`/`fall_time` unspecified or zero they "default to the
         // value defined by `default_transition"; without that directive -- which this
         // compiler does not implement -- "a negligible, but non-zero, transition time
@@ -1946,6 +1965,17 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let min_ramp = self.ctx.fconst(MIN_RAMP);
         let rise = self.fmax(rise, min_ramp);
         let fall = self.fmax(fall, min_ramp);
+
+        // The smallest step worth asking for on the way to a corner. Relative to
+        // the elapsed time rather than to the step being bounded, so it cannot be
+        // driven towards zero by the very requests it is flooring.
+        let tol = match time_tol {
+            Some(tol) => tol,
+            None => {
+                let scale = self.ctx.fconst(1e-9);
+                self.ctx.ins().fmul(now, scale)
+            }
+        };
 
         let one = self.ctx.fconst(1.0);
         let unset = self.ctx.fconst(NEVER);
@@ -2122,7 +2152,8 @@ impl BodyLoweringCtx<'_, '_, '_> {
             let ahead = self.ctx.ins().fgt(togo, F_ZERO);
             let set = self.ctx.ins().flt(at, unset_test);
             let want = self.and(ahead, set);
-            let bound = self.ctx.make_select(want, |_s, b| if b { togo } else { no_bound });
+            let aim = self.fmax(togo, tol);
+            let bound = self.ctx.make_select(want, |_s, b| if b { aim } else { no_bound });
             self.bound_step(bound);
         }
 
@@ -2147,7 +2178,8 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let resolved = self.ctx.ins().fgt(span_next, min_ramp);
         let want = self.and(ahead, moving);
         let want = self.and(want, resolved);
-        let bound = self.ctx.make_select(want, |_s, b| if b { togo } else { no_bound });
+        let aim = self.fmax(togo, tol);
+        let bound = self.ctx.make_select(want, |_s, b| if b { aim } else { no_bound });
         self.bound_step(bound);
 
         cur

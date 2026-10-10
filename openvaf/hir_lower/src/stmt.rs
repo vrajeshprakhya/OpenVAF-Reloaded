@@ -29,9 +29,10 @@ impl BodyLoweringCtx<'_, '_, '_> {
     /// identically zero. A step the solver shortens for its own reasons costs
     /// nothing, since the cap is recomputed, closer, on the next evaluation.
     ///
-    /// That is also why `time_tol` is accepted and then ignored. The clause asks the
-    /// simulator to place a point "within time_tol of an event"; placing it exactly
-    /// on the event satisfies any tolerance.
+    /// `time_tol` is what the clause calls the width of that landing: "the analog
+    /// simulator places a time point within time_tol of an event". With none given
+    /// the default is "at, or just beyond, the time of the event", so the window is
+    /// closed on the early side and the cap lands the point exactly on it.
     fn lower_timer(&mut self, args: &[ExprId]) -> Option<Value> {
         let start = *args.first()?;
         if self.body.is_missing(start) {
@@ -49,9 +50,49 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let state = self.ctx.alloc_retained_state(-1.0);
         let prev = self.ctx.retained_prev(state);
         let unscheduled = self.ctx.ins().flt(prev, F_ZERO);
-        let next = self.ctx.make_select(unscheduled, |_s, taken| if taken { start } else { prev });
 
-        let reached = self.ctx.ins().fge(now, next);
+        // "If the start_time or period expressions change value during the evaluation
+        // of the analog block, the next event will be scheduled based on the latest
+        // value of the start_time and period." So `start_time` is not read once and
+        // kept: a second slot remembers the value the live schedule was built from,
+        // and a different one reschedules onto the new time.
+        //
+        // That sentence is what makes an event-driven clock source writable, where
+        // each event's handler names the time of the next one -- a DCO with
+        // cycle-to-cycle jitter, a divider that stretches a period, a spread-spectrum
+        // source. Without it such a model fires once and then stands still, because
+        // its first `start_time` is the only one ever read.
+        let last_start = self.ctx.alloc_retained_state(0.0);
+        let scheduled_from = self.ctx.retained_prev(last_start);
+        self.ctx.store_retained(last_start, start);
+        let rescheduled = self.ctx.ins().fne(start, scheduled_from);
+        let from_start = self.or(unscheduled, rescheduled);
+        let next = self.ctx.make_select(from_start, |_s, taken| if taken { start } else { prev });
+
+        // A model that computes its own event times is adding up a chain of
+        // intervals while the solver adds up a chain of steps, and the two sums can
+        // land a hair apart even when the arithmetic says they agree. `time_tol` is
+        // the clause's own answer to how near is near enough, so it opens the window
+        // by that much on the early side instead of being accepted and ignored.
+        //
+        // Zero is not a safe default. An instant missed by its last bit is an instant
+        // still ahead, so the event does not fire and the cap below asks for the
+        // attosecond in between, and then for the one in between that, until the
+        // solver gives up with "timestep too small" -- which is what a reference
+        // clock and an oscillator whose edges coincide used to do. So with none given
+        // the tool picks one, as the clause allows: a part in 1e12 of the instant
+        // itself, which is some thousands of times the precision the instant is held
+        // to and a trillionth of the time it names.
+        let tol = match args.get(2) {
+            Some(&t) if !self.body.is_missing(t) => self.lower_expr(t),
+            _ => {
+                let scale = self.ctx.fconst(1e-12);
+                let from_zero = self.fmax(next, F_ZERO);
+                self.ctx.ins().fmul(from_zero, scale)
+            }
+        };
+        let window = self.ctx.ins().fsub(next, tol);
+        let reached = self.ctx.ins().fge(now, window);
 
         // "If the period expression evaluates to a value less than or equal to 0.0,
         // the timer shall trigger only once at the specified start_time." A
@@ -64,7 +105,11 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let divisor = self.ctx.make_select(periodic, |_s, taken| if taken { period } else { one });
         // Skip whole periods in case the solver got past several at once:
         //   next + period * (floor((now - next) / period) + 1)
+        // Clamped at zero, because an event taken inside `time_tol` is taken
+        // *before* its instant: a negative elapsed time floors to -1, advances the
+        // schedule by nothing and leaves the same instant due for ever.
         let elapsed = self.ctx.ins().fsub(now, next);
+        let elapsed = self.fmax(elapsed, F_ZERO);
         let periods = self.ctx.ins().fdiv(elapsed, divisor);
         let periods = self.ctx.ins().floor(periods);
         let periods = self.ctx.ins().fadd(periods, one);
@@ -91,8 +136,10 @@ impl BodyLoweringCtx<'_, '_, '_> {
 
         // Ask for a timepoint on the next event, but not while inactive -- a disabled
         // timer should not be steering the timestep either.
+        // Nothing to ask for once the point already stands within tolerance of the
+        // instant: it has been placed, which is all the clause asks of the simulator.
         let remaining = self.ctx.ins().fsub(new_next, now);
-        let due = self.ctx.ins().fgt(remaining, F_ZERO);
+        let due = self.ctx.ins().fgt(remaining, tol);
         let due = match enabled {
             Some(en) => self.and(due, en),
             None => due,
@@ -266,9 +313,10 @@ impl BodyLoweringCtx<'_, '_, '_> {
     ///
     /// `time_tol` is the floor: never propose a step below it, which is both what
     /// stops the refinement and what "within time_tol of the crossing" buys. With
-    /// none given the tool picks one, as the clause allows -- here a thousandth of
-    /// the step already being taken, which is relative to whatever scale the solver
-    /// is working at and cannot collapse towards zero on its own.
+    /// none given the tool picks one, as the clause allows -- a thousandth of the
+    /// step already being taken, which is relative to whatever scale the solver is
+    /// working at, but not less than a part in 1e9 of the elapsed time, so that it
+    /// cannot follow the step it is bounding down towards zero.
     fn bound_step_to_crossing(
         &mut self,
         args: &[ExprId],
@@ -307,8 +355,25 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let tol = match args.get(tol_arg) {
             Some(&tol) if !self.body.is_missing(tol) => self.lower_expr(tol),
             _ => {
-                let scale = self.ctx.fconst(1e-3);
-                self.ctx.ins().fmul(dt_safe, scale)
+                // A thousandth of the step already being taken, which is relative to
+                // whatever scale the solver is working at -- and never less than a
+                // part in 1e9 of the time already elapsed, because the floor is only
+                // worth anything if the step it proposes is one the solver can take.
+                //
+                // Each capped step is the next evaluation's yardstick, so without
+                // that second term the tolerance follows the step down by a factor of
+                // a thousand per evaluation, and an expression resting a hair short
+                // of the threshold takes both of them past the point where a proposed
+                // step still moves `$abstime` at all. A divider output caught half way
+                // up its own transition ramp is resting exactly on a phase detector's
+                // switching point, which in a PLL is routine rather than contrived: it
+                // took the timestep to 1e-20 s and ngspice gave up with "timestep too
+                // small".
+                let fine = self.ctx.fconst(1e-3);
+                let fine = self.ctx.ins().fmul(dt_safe, fine);
+                let floor = self.ctx.fconst(1e-9);
+                let floor = self.ctx.ins().fmul(now, floor);
+                self.fmax(fine, floor)
             }
         };
         let too_fine = self.ctx.ins().flt(togo, tol);
@@ -560,6 +625,17 @@ impl BodyLoweringCtx<'_, '_, '_> {
         if let Some(default_case) =
             case_arms.iter().find(|arm| matches!(arm.cond, CaseCond::Default))
         {
+            // The default arm is lowered into the block the last condition falls
+            // through to, and that block has to be sealed first: every arm above it
+            // has had its chance, so no further predecessor can appear. An open block
+            // answers a variable read with a placeholder phi to be filled in when it
+            // is sealed, and a body that branches -- any analog operator with a
+            // select in it -- reads through that placeholder from a *successor*
+            // block, which is no longer the one that gets filled. The value then
+            // reaches codegen undefined. Each arm body above is lowered into a
+            // `body_head` that is sealed on purpose for the same reason; this one was
+            // missed, and `transition()` in a default arm crashed the compiler.
+            self.ctx.ensured_sealed();
             self.lower_stmt(default_case.body);
         }
 
