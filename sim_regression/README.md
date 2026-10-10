@@ -27,6 +27,7 @@ above_init     PASS
 last_crossing  PASS
 timer          PASS
 transition     PASS
+absdelay       PASS
 ```
 
 Or one at a time:
@@ -58,6 +59,12 @@ cd ../transition
 ../../target/release/openvaf-r trfilter.va -o trfilter.osdi
 ngspice -b trfilter.cir
 python3 ../analyze_transition.py
+
+cd ../absdelay
+../../target/release/openvaf-r addelay.va -o addelay.osdi
+../../target/release/openvaf-r --absdelay in-model addelay.va -o addelay_in_model.osdi
+ngspice -b addelay_in_model.cir
+python3 ../analyze_absdelay.py
 ```
 
 Each analyzer exits non-zero on failure.
@@ -213,6 +220,64 @@ fall from the current value over `tf` would give.
 The linearity tolerance is derived from the printed time resolution rather than
 fixed: `wrdata` gives the time column 9 significant digits, and on the 1 ns fall
 that uncertainty already shows up in the value at the 1e-7 level.
+
+## absdelay — passing
+
+VAMS-2023 4.5.7 is the one operator with two realizations to compare, so this
+case runs the same model twice.
+
+```
+absdelay       PASS
+  in-model fixed delay: worst error 8.882e-16 V at 4.006 us
+  in-model figure 4-4:  worst error 8.882e-16 V at 5.066 us
+  protocol fixed delay: worst error 8.882e-16 V at 4.006 us
+  protocol figure 4-4:  worst error 8.882e-16 V at 5.066 us
+  the two realizations differ by at most 0.000e+00 V (at 0.000 us)
+```
+
+The clause gives the operator in closed form — `Output(t) = Input(max(t - td, 0))`
+— and the input is a 1 V/us ramp, so every expected value is arithmetic rather
+than a reference waveform.
+
+The second channel is Figure 4-4: a delay of 2 us until t = 3 us, then 4 us until
+t = 5 us, then 1 us, under a `maxdelay` of 5 us, which is the only way the clause
+allows `td` to vary at all. The figure's own narration is the test: the output
+holds `input(0)` until t reaches the delay, tracks `input(t - 2)` from 2 us,
+*returns* to `input(0)` at 3 us when the delay grows past the elapsed time, picks
+the ramp up again at 4 us, and jumps when the delay shortens at 5 us.
+
+**The protocol half needs a patched simulator.** `absdelay` is realized through
+the OSDI descriptor by default (`OsdiAbsDelayInfo`): the compiler emits the
+delayed output as an unknown and leaves its row empty, because the input's history
+is not something a model evaluation has. ngspice has never implemented that
+protocol, and an unstamped row is a singular matrix:
+
+```
+Warning: singular matrix:  check node nad#implicit_equation_2
+Error: Transient op failed, timestep too small
+```
+
+`patches/ngspice-absdelay-history.patch` implements it against ngspice-46, for
+both the SPARSE and KLU solvers plus AC, where the delay is a phase shift. Point
+`NGSPICE_ABSDELAY` at the patched binary and `run_all.sh` checks that half too;
+without it the protocol run is skipped with a note and the in-model half still
+runs.
+
+```sh
+cd sim_regression/absdelay
+../../target/release/openvaf-r addelay.va -o addelay.osdi
+../../target/release/openvaf-r --absdelay in-model addelay.va -o addelay_in_model.osdi
+ngspice -b addelay_in_model.cir          # any ngspice
+$NGSPICE_ABSDELAY -b addelay.cir         # needs the patch
+python3 ../analyze_absdelay.py
+```
+
+Measured alongside, on a netlist that would otherwise step in microseconds: the
+protocol takes 59 timepoints over 6 us, the in-model realization 187, because it
+caps the step at the spacing of its own history grid. In AC at 100 kHz with
+`td = 1 us` the protocol gives exactly −0.628 rad and the in-model realization
+gives none at all; it has no phase to offer, which is the other half of why the
+protocol is the default.
 
 ## Why retained state does not live in the OSDI state array
 

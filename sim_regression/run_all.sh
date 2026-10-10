@@ -44,10 +44,46 @@ run() {
     fi
 }
 
+# absdelay is the one case with two realizations to compare (VAMS-2023 4.5.7).
+# The in-model one runs anywhere; the descriptor protocol needs a simulator that
+# implements `OsdiAbsDelayInfo`, so point NGSPICE_ABSDELAY at a patched binary
+# (patches/ngspice-absdelay-history.patch) to have that half checked too.
+run_absdelay() {
+    dir=absdelay
+    cd "$here/$dir" || return 1
+    rm -f ad_out.txt ad_proto_out.txt
+
+    for mode in "" "--absdelay in-model"; do
+        out=addelay.osdi
+        [ -n "$mode" ] && out=addelay_in_model.osdi
+        if ! "$OV" $mode "addelay.va" -o "$out" >/dev/null 2>&1; then
+            printf '%-14s COMPILE FAILED\n' "$dir"
+            "$OV" $mode "addelay.va" -o "$out"
+            fail=1
+            return
+        fi
+    done
+
+    "$NG" -b addelay_in_model.cir > addelay_in_model.log 2>&1
+    if [ -n "${NGSPICE_ABSDELAY:-}" ]; then
+        "$NGSPICE_ABSDELAY" -b addelay.cir > addelay.log 2>&1
+    fi
+
+    if log=$(python3 "../analyze_absdelay.py" 2>&1); then
+        printf '%-14s PASS\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+    else
+        printf '%-14s FAIL\n' "$dir"
+        printf '%s\n' "$log" | sed 's/^/  /'
+        fail=1
+    fi
+}
+
 run sample_hold   sample_hold   sh_out.txt analyze_sample_hold.py
 run above_init    above_init    ai_out.txt analyze_above_init.py
 run last_crossing last_crossing lc_out.txt analyze_last_crossing.py
 run timer         timer         tm_out.txt analyze_timer.py
 run transition    trfilter      tr_out.txt analyze_transition.py
+run_absdelay
 
 exit $fail

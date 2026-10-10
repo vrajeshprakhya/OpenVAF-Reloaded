@@ -68,6 +68,49 @@ gates far less than it first appears: it is a cleanup, not a prerequisite. The
 precedent for how it should look is `absdelay`: a descriptor-level protocol where
 the simulator owns the time-dependent part.
 
+## Tier 0 — compiles, and then no simulator can run it
+
+One item, found while probing this page's own claims: `absdelay` (4.5.7).
+
+It was listed under "confirmed working", and the compiler's half of it is. The
+other half is not the compiler's: the delayed output is emitted as an unknown
+whose row the model deliberately leaves empty, and the descriptor hands the input's
+history to the simulator (`OsdiAbsDelayInfo`, `osdi/src/metadata.rs:403`), because
+history is the one thing a model evaluation does not have. No released simulator
+implements that protocol. An unstamped row is a singular matrix:
+
+```
+Warning: singular matrix:  check node nad#implicit_equation_2
+Error: Transient op failed, timestep too small
+```
+
+so in ngspice the model does not misbehave, it does not run. The in-tree mock
+simulator refused it outright rather than implementing it, which is why no test
+caught this.
+
+Both halves now exist:
+
+| | Realization | Where |
+| --- | --- | --- |
+| default | the descriptor protocol; the simulator owns the history | `patches/ngspice-absdelay-history.patch` implements it for ngspice-46 (SPARSE and KLU, plus the AC phase shift), and `openvaf/tests/mock_sim` for the in-tree tests |
+| `--absdelay in-model` | the model keeps the history in retained state | needs nothing of the simulator; runs on a stock ngspice |
+
+The in-model realization is a shift register of (time, value) pairs with linear
+interpolation and `$bound_step` capped at their spacing, which is also its cost:
+a delay is resolved to `window / (depth - 2)` and the run takes at least that many
+steps per delay window (measured: 187 timepoints where the protocol takes 59), and
+in a small-signal analysis it has no phase shift to offer, where 4.5.7 asks for
+`exp(-j w td)`. That is why the protocol stays the default. Both are measured
+against the clause's closed form in `sim_regression/absdelay`, Figure 4-4's
+time-varying delay included.
+
+Also fixed on the way: a delay argument that was neither a parameter nor a literal
+(`absdelay(x, 2 * td)`) crashed the backend with "attempted to read undefined
+value". The delay is read by the simulator out of the instance data, so it is an
+output of the evaluation, but nothing said so and the pass that moves
+op-independent work into instance setup left the eval function holding a value no
+longer computed there.
+
 ## Tier 1 — accepted but not honoured
 
 The worst category is a model that compiles, behaves differently from what it
@@ -270,7 +313,7 @@ hits without warning.
 ## Confirmed working
 
 Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
-`absdelay`, `transition`, `slew`, `ddx`, `limexp`, `last_crossing`, all four
+`transition`, `slew`, `ddx`, `limexp`, `last_crossing`, all four
 `laplace_*` forms
 (4.5.11), `white_noise` / `flicker_noise` / `ac_stim` / `analysis` (4.6),
 `$limit` (9.17.3), `$bound_step` (9.17.2), named events and `->` (5.10.4),
