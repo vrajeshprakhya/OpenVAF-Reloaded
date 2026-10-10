@@ -71,6 +71,8 @@ pub fn stub_callbacks<'ll>(
                 | CallBackKind::BuiltinLimit { .. }
                 | CallBackKind::StoreLimit(_)
                 | CallBackKind::StoreRetained(_)
+                | CallBackKind::File(_)
+                | CallBackKind::RetainedFirst(_)
                 | CallBackKind::RngValue(_)
                 | CallBackKind::RngSeed(_)
                 | CallBackKind::LimDiscontinuity

@@ -25,8 +25,8 @@ use crate::body::BodyLoweringCtx;
 
 use crate::fmt::DisplayKind;
 use crate::{
-    AbsDelayMode, CallBackKind, CurrentKind, IdtKind, ImplicitEquationKind, NoiseTable, ParamKind,
-    PlaceKind, RetFlag, RngDist,
+    AbsDelayMode, CallBackKind, CurrentKind, FileOp, IdtKind, ImplicitEquationKind, NoiseTable,
+    ParamKind, PlaceKind, RetFlag, RngDist,
 };
 
 impl BodyLoweringCtx<'_, '_, '_> {
@@ -821,9 +821,78 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 self.ins_display(DisplayKind::Display, false, args);
                 GRAVESTONE
             }
-            BuiltIn::display | BuiltIn::strobe | BuiltIn::monitor => {
+            BuiltIn::display | BuiltIn::monitor => {
                 self.ins_display(DisplayKind::Display, true, args);
                 GRAVESTONE
+            }
+            // 9.4.1: `$strobe` "displays the simulation data at the end of the
+            // current simulation time", which in an analog block is once for the
+            // timepoint rather than once for each of the Newton iterations that
+            // settle it. `$display` is the one that writes whenever it is reached.
+            BuiltIn::strobe => {
+                self.strobe(DisplayKind::Display, None, args);
+                GRAVESTONE
+            }
+
+            // -- 9.5.2: the same tasks, writing to a descriptor -----------------
+            BuiltIn::fdisplay | BuiltIn::fwrite | BuiltIn::fdebug | BuiltIn::fstrobe => {
+                let desc = self.lower_expr(args[0]);
+                let rest = &args[1..];
+                let kind = if builtin == BuiltIn::fdebug {
+                    DisplayKind::Debug
+                } else {
+                    DisplayKind::Display
+                };
+                match builtin {
+                    BuiltIn::fstrobe => self.strobe(kind, Some(desc), rest),
+                    // "$fwrite ... does not append a newline".
+                    BuiltIn::fwrite => self.ins_display_file(kind, false, desc, rest),
+                    _ => self.ins_display_file(kind, true, desc, rest),
+                }
+                GRAVESTONE
+            }
+
+            // -- 9.5.1, 9.5.5, 9.5.6, 9.5.8: the file itself --------------------
+            BuiltIn::fopen => {
+                let name = self.lower_expr(args[0]);
+                match args.get(1) {
+                    // "$fopen(name, mode) ... returns a file descriptor"
+                    Some(&mode) if !self.body.is_missing(mode) => {
+                        let mode = self.lower_expr(mode);
+                        self.ctx.call1(CallBackKind::File(FileOp::Open), &[name, mode])
+                    }
+                    // "$fopen(name) ... returns a multichannel descriptor"
+                    _ => self.ctx.call1(CallBackKind::File(FileOp::OpenMcd), &[name]),
+                }
+            }
+            BuiltIn::fflush => match args.first() {
+                Some(&desc) if !self.body.is_missing(desc) => {
+                    let desc = self.lower_expr(desc);
+                    let no = self.ctx.iconst(0);
+                    self.ctx.call1(CallBackKind::File(FileOp::Flush), &[desc, no])
+                }
+                // "$fflush() ... flushes the output buffers of all open files"
+                _ => {
+                    let zero = self.ctx.iconst(0);
+                    let yes = self.ctx.iconst(1);
+                    self.ctx.call1(CallBackKind::File(FileOp::FlushAll), &[zero, yes])
+                }
+            },
+            BuiltIn::fclose | BuiltIn::feof | BuiltIn::ftell | BuiltIn::rewind => {
+                let desc = self.lower_expr(args[0]);
+                let op = match builtin {
+                    BuiltIn::fclose => FileOp::Close,
+                    BuiltIn::feof => FileOp::Eof,
+                    BuiltIn::ftell => FileOp::Tell,
+                    _ => FileOp::Rewind,
+                };
+                self.ctx.call1(CallBackKind::File(op), &[desc])
+            }
+            BuiltIn::fseek => {
+                let desc = self.lower_expr(args[0]);
+                let offset = self.lower_expr(args[1]);
+                let whence = self.lower_expr(args[2]);
+                self.ctx.call1(CallBackKind::File(FileOp::Seek), &[desc, offset, whence])
             }
             BuiltIn::debug => {
                 self.ins_display(DisplayKind::Debug, true, args);
@@ -1474,6 +1543,51 @@ impl BodyLoweringCtx<'_, '_, '_> {
         }
 
         value
+    }
+
+    /// 9.4.1/9.5.2: `$strobe` and `$fstrobe` write once for the timepoint, not once
+    /// for each evaluation of it.
+    ///
+    /// "At the end of the current simulation time" is the digital reading of a
+    /// statement that an analog block reaches many times while the solver settles
+    /// one point. Writing on the first evaluation at a new time is the closest thing
+    /// an analog model can say: there is no hook for "the solution is final", and
+    /// buffering the line until the step is accepted would hold back a line the
+    /// model has already composed, with nothing to flush it at the end of the run.
+    ///
+    /// So a line per attempted timepoint, where `$display` gives a line per
+    /// iteration -- and a step the solver goes on to reject leaves its line behind,
+    /// visible as a time column that goes backwards.
+    ///
+    /// The cell is the uncommitted half of a retained slot, which is per instance
+    /// and is written as soon as it is assigned, so two instances of the same model
+    /// do not silence each other. Without retained state at all (the init function,
+    /// verilogae) there is nothing to key on and the write is unconditional.
+    fn strobe(&mut self, kind: DisplayKind, desc: Option<Value>, args: &[ExprId]) {
+        if self.ctx.no_equations {
+            match desc {
+                Some(desc) => self.ins_display_file(kind, true, desc, args),
+                None => self.ins_display(kind, true, args),
+            }
+            return;
+        }
+
+        // A time no simulation reaches, so the first evaluation of all is a new one.
+        let cell = self.ctx.alloc_retained_state(-1.0);
+        let now = self.ctx.use_param(ParamKind::Abstime);
+        let first = self.ctx.call1(CallBackKind::RetainedFirst(cell), &[now]);
+        let first = self.ctx.ins().fne(first, F_ZERO);
+
+        let args: Vec<ExprId> = args.to_vec();
+        self.ctx.make_cond(first, |ctx, branch| {
+            if branch {
+                let mut body = BodyLoweringCtx { body: self.body, path: self.path, ctx };
+                match desc {
+                    Some(desc) => body.ins_display_file(kind, true, desc, &args),
+                    None => body.ins_display(kind, true, &args),
+                }
+            }
+        });
     }
 
     /// An optional analog-operator argument. Absent and written as a null argument

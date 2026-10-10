@@ -35,6 +35,9 @@ struct CbCtx {
 
 enum CbCtxKind {
     Print {
+        /// 9.5's forms carry a descriptor the runner has no file behind, so their
+        /// output joins everything else on the host's own streams.
+        to_file: bool,
         kind: DisplayKind,
         arg_tys: Box<[FmtArg]>,
     },
@@ -113,8 +116,8 @@ fn interpret_body(
         TiVec::with_capacity(intern.callbacks.len());
     for (_func_ref, kind) in intern.callbacks.iter_enumerated() {
         let cb_kind = match kind {
-            CallBackKind::Print { kind, arg_tys } => {
-                CbCtxKind::Print { kind: *kind, arg_tys: arg_tys.clone() }
+            CallBackKind::Print { kind, to_file, arg_tys } => {
+                CbCtxKind::Print { kind: *kind, to_file: *to_file, arg_tys: arg_tys.clone() }
             }
             CallBackKind::SetRetFlag(flag) => CbCtxKind::SetRetFlag(*flag),
             other => CbCtxKind::Unsupported(format!("{other:?}")),
@@ -148,7 +151,10 @@ fn host_callback(state: &mut InterpreterState, args: &[Value], _rets: &[Value], 
     let literals = unsafe { &*ctx.literals };
 
     match &ctx.kind {
-        CbCtxKind::Print { kind, arg_tys } => {
+        CbCtxKind::Print { kind, to_file, arg_tys } => {
+            // The descriptor comes first in the file forms; there is nothing here
+            // for it to name, so it is read past and the line goes to the host.
+            let args = if *to_file { &args[1..] } else { args };
             let fmt = literals.resolve(&state.read::<Spur>(args[0]));
             let rendered = render_format(fmt, &args[1..], arg_tys, state, literals);
             match kind {

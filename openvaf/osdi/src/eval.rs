@@ -402,6 +402,24 @@ impl<'ll> OsdiCompilationUnit<'_, '_, 'll> {
                         num_state: 0,
                     })
                 }
+                // Shares the cell StoreRetained writes, and for the same reason
+                // needs the instance in order to find it.
+                CallBackKind::RetainedFirst(state) => {
+                    let fun = builder
+                        .cx
+                        .get_func_by_name("retained_first")
+                        .expect("stdlib function retained_first is missing");
+                    let fun_ty = cx.ty_func(&[cx.ty_ptr(), cx.ty_double()], cx.ty_double());
+                    let ptr = unsafe {
+                        inst_data.retained_pending_ptr(cx, state, instance, builder.llbuilder)
+                    };
+                    CallbackFun::Prebuilt(BuiltCallbackFun {
+                        fun_ty,
+                        fun,
+                        state: Box::new([ptr]),
+                        num_state: 0,
+                    })
+                }
                 CallBackKind::LimDiscontinuity => {
                     let fun = builder
                         .cx

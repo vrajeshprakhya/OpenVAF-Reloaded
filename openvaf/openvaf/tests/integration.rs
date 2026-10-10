@@ -984,6 +984,82 @@ fn test_timer_resched() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 9.5: the file tasks, measured by reading the file back.
+///
+/// The claim worth testing is not that a line arrives -- it is *which* lines
+/// arrive. `$fdisplay` writes every time the statement is reached, which in an
+/// analog block is once per Newton iteration; `$fstrobe` writes "at the end of
+/// the current simulation time", which is once per timepoint. So the two counts
+/// have to come out different, in a known ratio, from the same model.
+fn test_file_io() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    // The name the model has baked in, resolved against this process's working
+    // directory, which is what the model's own relative path resolves against too.
+    let log = std::path::Path::new("openvaf_file_io_test.txt");
+    let _ = std::fs::remove_file(log);
+
+    const TIMEPOINTS: usize = 3;
+    const ITERS: usize = 3;
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("file_io.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let mut first = true;
+    let mut tell = Vec::new();
+    for step in 0..TIMEPOINTS {
+        for _ in 0..ITERS {
+            if !first {
+                sim.next_iter();
+            }
+            first = false;
+            sim.set_voltage("in", step as f64);
+            sim.set_voltage("pos", 0.0);
+            instance.eval(&model, &mut sim, EvalFlags::empty());
+            instance.load_dae(&model, &mut sim);
+            tell.push(sim.read_residual("flow(pos)").0);
+        }
+        // An accepted timestep, which is the only thing that makes a new timepoint.
+        sim.advance_time(1.0);
+    }
+
+    let text = std::fs::read_to_string(log)
+        .unwrap_or_else(|e| panic!("the model did not leave {} behind: {e}", log.display()));
+    let _ = std::fs::remove_file(log);
+
+    let strobes: Vec<&str> = text.lines().filter(|l| l.starts_with("strobe")).collect();
+    let displays: Vec<&str> = text.lines().filter(|l| l.starts_with("display")).collect();
+
+    // 5.10.2 puts `@(initial_step)` in force "during the solution of the first
+    // point", which is all of its iterations and not only the first, so the header
+    // is written once per iteration of that point. The file is nevertheless opened
+    // once: were it reopened, the mode would truncate it and only the last header
+    // would still be here.
+    assert_eq!(text.lines().filter(|l| *l == "# opened").count(), ITERS);
+
+    // One line per evaluation against one line per timepoint.
+    assert_eq!(displays.len(), TIMEPOINTS * ITERS, "$fdisplay wrote {displays:?}");
+    assert_eq!(strobes.len(), TIMEPOINTS, "$fstrobe wrote {strobes:?}");
+
+    // And the strobed lines are the timepoints themselves, each carrying the input
+    // that was applied at it.
+    for (step, line) in strobes.iter().enumerate() {
+        assert_eq!(*line, format!("strobe {step} {step}"), "strobe line {step}");
+    }
+
+    // 9.5.5: `$ftell` is where the file has got to, so it only ever grows, and it
+    // grew by exactly the bytes written.
+    assert!(tell.windows(2).all(|w| w[1] > w[0]), "$ftell did not advance: {tell:?}");
+    float_cmp::assert_approx_eq!(f64, *tell.last().unwrap(), text.len() as f64, epsilon = 1e-9);
+
+    Ok(())
+}
+
 /// An analog operator in the `default` arm of a `case` used to crash the compiler
 /// ("attempted to read undefined value"), because the default arm is lowered into
 /// the still-open block the last condition falls through to. `case_default.va`
@@ -1757,5 +1833,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io)]
 }

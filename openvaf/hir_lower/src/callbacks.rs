@@ -51,9 +51,63 @@ impl std::fmt::Display for RetFlag {
     }
 }
 
+/// VAMS-2023 9.5: what to do to a file, once the descriptor naming it is in hand.
+/// Each one is a function in `openvaf/osdi/stdlib.c`, which owns the table a
+/// descriptor indexes.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum FileOp {
+    /// `$fopen(name)`: a multichannel descriptor, one bit per file.
+    OpenMcd,
+    /// `$fopen(name, mode)`: a file descriptor, with the top bit set.
+    Open,
+    Close,
+    Flush,
+    /// `$fflush()` with no argument, which flushes everything open.
+    FlushAll,
+    Eof,
+    Tell,
+    Seek,
+    Rewind,
+}
+
+impl FileOp {
+    /// The name of the function in the stdlib that performs it.
+    pub fn stdlib_name(self) -> &'static str {
+        match self {
+            FileOp::OpenMcd => "va_fopen_mcd",
+            FileOp::Open => "va_fopen",
+            FileOp::Close => "va_fclose",
+            FileOp::Flush | FileOp::FlushAll => "va_fflush",
+            FileOp::Eof => "va_feof",
+            FileOp::Tell => "va_ftell",
+            FileOp::Seek => "va_fseek",
+            FileOp::Rewind => "va_rewind",
+        }
+    }
+
+    /// How many arguments it is called with. `$fflush` takes the descriptor and a
+    /// flag saying to ignore it, so that both of 9.5.6's forms are one function.
+    pub fn num_args(self) -> u16 {
+        match self {
+            FileOp::OpenMcd => 1,
+            FileOp::Open | FileOp::Flush | FileOp::FlushAll => 2,
+            FileOp::Close | FileOp::Eof | FileOp::Tell | FileOp::Rewind => 1,
+            FileOp::Seek => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum CallBackKind {
-    Print { kind: DisplayKind, arg_tys: Box<[FmtArg]> },
+    /// `to_file` is 9.5's half of 9.4: the same formatting, but the first argument
+    /// is a descriptor and the text goes wherever that names instead of to the
+    /// simulator's log.
+    Print { kind: DisplayKind, to_file: bool, arg_tys: Box<[FmtArg]> },
+    File(FileOp),
+    /// Whether this is the first evaluation at the current timepoint, which is what
+    /// 9.4.1's "at the end of the current simulation time" needs in order not to
+    /// mean "once per Newton iteration". Carries its own cell.
+    RetainedFirst(RetainedState),
     SimParam,
     SimParamOpt,
     SimParamStr,
@@ -123,9 +177,10 @@ impl CallBackKind {
                 returns: 0,
                 has_sideeffects: true,
             },
-            CallBackKind::Print { kind, arg_tys: args } => FunctionSignature {
-                name: format!("{:?})", kind),
-                params: args.len() as u16 + 1,
+            CallBackKind::Print { kind, to_file, arg_tys: args } => FunctionSignature {
+                name: if *to_file { format!("f{:?})", kind) } else { format!("{:?})", kind) },
+                // The format string, plus the descriptor for the file forms.
+                params: args.len() as u16 + 1 + u16::from(*to_file),
                 returns: 0,
                 has_sideeffects: true,
             },
@@ -154,6 +209,21 @@ impl CallBackKind {
                 params: 3,
                 returns: 1,
                 has_sideeffects: false,
+            },
+            CallBackKind::File(op) => FunctionSignature {
+                name: op.stdlib_name().to_owned(),
+                params: op.num_args(),
+                returns: 1,
+                // Opening, closing and seeking a file are the point of calling them,
+                // and the returned status is usually dropped.
+                has_sideeffects: true,
+            },
+            CallBackKind::RetainedFirst(state) => FunctionSignature {
+                name: format!("$retained_first[{state:?}]"),
+                params: 1,
+                returns: 1,
+                // It writes the cell it tests, so it is not a pure predicate.
+                has_sideeffects: true,
             },
             CallBackKind::StoreRetained(state) => FunctionSignature {
                 name: format!("$store_retained[{state:?}]"),

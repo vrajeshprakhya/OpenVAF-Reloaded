@@ -25,30 +25,23 @@ const ANALOG_OPERATORS: [&str; 17] = [
     "transition",
 ];
 
-const UNSUPPORTED: [&str; 23] = [
+// What is left of 9.5 after the output side of it: everything here either writes
+// back through an argument (, , , ) or
+// writes back through a variable number of them (, ), and
+//  has to notice its arguments changing.
+const UNSUPPORTED: [&str; 12] = [
     "simprobe",
     "analog_node_alias",
     "analog_port_alias",
     "test_plusargs",
     "value_plusargs",
-    "fclose",
-    "fopen",
-    "fdisplay",
-    "fwrite",
-    "fstrobe",
     "fmonitor",
     "fgets",
     "fscanf",
     "swrite",
     "sformat",
     "sscanf",
-    "rewind",
-    "fseek",
-    "ftell",
-    "fflush",
     "ferror",
-    "feof",
-    "fdebug",
 ];
 
 const ANALOG_OPERATORS_SYSFUN: [&str; 1] = ["$limit"];

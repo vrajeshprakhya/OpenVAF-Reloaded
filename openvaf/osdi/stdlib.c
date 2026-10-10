@@ -16,6 +16,17 @@ extern double log(double);
 extern double exp(double);
 extern double sqrt(double);
 extern int strcmp(const char*, const char*);
+/* VAMS-2023 9.5. Declared rather than included for the same reason as the rest
+ * of this block: the file is compiled freestanding, and the library it ends up
+ * in is loaded into a process that has a libc. */
+extern void free(void *);
+extern void *fopen(const char *, const char *);
+extern int fclose(void *);
+extern int fputs(const char *, void *);
+extern int fflush(void *);
+extern int feof(void *);
+extern long ftell(void *);
+extern int fseek(void *, long, int);
 #define NULL ((void*)0)
 #else
 #include <math.h>
@@ -145,6 +156,263 @@ void push_invalid_param_err(void **dst, uint32_t *len, uint32_t *cap,
 }
 
 void bound_step(double *dst, double val) { *dst = val; }
+
+/* --- VAMS-2023 9.5: files --------------------------------------------------
+ *
+ * 9.5.1 keeps two kinds of descriptor in one integer, and which kind a given
+ * one is lives in the value: `$fopen(name)` returns a *multichannel* descriptor
+ * with a single bit set, `$fopen(name, mode)` a *file* descriptor with the top
+ * bit set and a small index below it. That is why every output task takes one
+ * integer and works for either, and why an mcd can name several files at once --
+ * `$fdisplay(mcd1 | mcd2, ...)` writes to both.
+ *
+ * Channel 0 of an mcd, and the three reserved file descriptors, are standard
+ * input, output and error. A model inside a simulator has no business writing to
+ * the process's stdout, and the simulator already has somewhere for a model's
+ * words to go, so those route to `osdi_log` -- the same place `$display` ends up.
+ *
+ * The tables are per loaded library rather than per instance, which is what the
+ * clause describes: a descriptor is an integer, so passing one between instances
+ * (or storing it in a parameter) has to mean the same file to both.
+ */
+
+#define VA_FD_BIT 0x80000000u
+#define VA_NMCD 31
+#define VA_NFD 32
+/* stdin, stdout, stderr as 9.5.1 numbers them. */
+#define VA_FD_RESERVED 3
+
+static void *va_mcd[VA_NMCD];
+static void *va_fd[VA_NFD];
+/* What each open descriptor was opened as: the mode and the name, so that a
+ * second request for the same pair can be answered with the same descriptor.
+ *
+ * 5.10.2 puts `@(initial_step)` in force "during the solution of the first
+ * point", which is every Newton iteration of it, not just the first -- so the one
+ * place a model can open a file once is a place it is asked to open it several
+ * times. Opening it again would truncate what the earlier iterations wrote and
+ * hand out a descriptor that nothing is holding, until the thirty of them run
+ * out. The clause says nothing either way; this is the reading that lets the
+ * idiom work. The cost is that a model wanting two independent handles on one
+ * file gets one, which is not something 9.5 offers a way to ask for.
+ */
+static char *va_mcd_key[VA_NMCD];
+static char *va_fd_key[VA_NFD];
+
+/* "shall return zero if the file could not be opened" -- for both forms, which
+ * is also why channel 0 is never handed out: its bit set alone would be 1. */
+int32_t va_fopen(const char *name, const char *mode) {
+  void *f;
+  char *key;
+  if (mode == NULL || name == NULL) {
+    return 0;
+  }
+  key = concat(mode, name);
+  if (key == NULL) {
+    return 0;
+  }
+  for (uint32_t i = VA_FD_RESERVED; i < VA_NFD; i++) {
+    if (va_fd[i] != NULL && va_fd_key[i] != NULL && strcmp(va_fd_key[i], key) == 0) {
+      free(key);
+      return (int32_t)(VA_FD_BIT | i);
+    }
+  }
+  f = fopen(name, mode);
+  if (f == NULL) {
+    free(key);
+    return 0;
+  }
+  for (uint32_t i = VA_FD_RESERVED; i < VA_NFD; i++) {
+    if (va_fd[i] == NULL) {
+      va_fd[i] = f;
+      va_fd_key[i] = key;
+      return (int32_t)(VA_FD_BIT | i);
+    }
+  }
+  fclose(f);
+  free(key);
+  return 0;
+}
+
+int32_t va_fopen_mcd(const char *name) {
+  void *f;
+  char *key;
+  if (name == NULL) {
+    return 0;
+  }
+  /* No mode: 9.5.1 opens a multichannel descriptor for writing. */
+  key = concat("w", name);
+  if (key == NULL) {
+    return 0;
+  }
+  for (uint32_t b = 1; b < VA_NMCD; b++) {
+    if (va_mcd[b] != NULL && va_mcd_key[b] != NULL && strcmp(va_mcd_key[b], key) == 0) {
+      free(key);
+      return (int32_t)(1u << b);
+    }
+  }
+  f = fopen(name, "w");
+  if (f == NULL) {
+    free(key);
+    return 0;
+  }
+  for (uint32_t b = 1; b < VA_NMCD; b++) {
+    if (va_mcd[b] == NULL) {
+      va_mcd[b] = f;
+      va_mcd_key[b] = key;
+      return (int32_t)(1u << b);
+    }
+  }
+  fclose(f);
+  free(key);
+  return 0;
+}
+
+/* A file descriptor names one file; a multichannel descriptor names every
+ * channel whose bit is set, so closing one closes all of them. */
+int32_t va_fclose(int32_t desc) {
+  uint32_t d = (uint32_t)desc;
+  if (d & VA_FD_BIT) {
+    uint32_t i = d & ~VA_FD_BIT;
+    if (i >= VA_FD_RESERVED && i < VA_NFD && va_fd[i] != NULL) {
+      fclose(va_fd[i]);
+      va_fd[i] = NULL;
+      free(va_fd_key[i]);
+      va_fd_key[i] = NULL;
+    }
+    return 0;
+  }
+  for (uint32_t b = 1; b < VA_NMCD; b++) {
+    if (((d >> b) & 1) && va_mcd[b] != NULL) {
+      fclose(va_mcd[b]);
+      va_mcd[b] = NULL;
+      free(va_mcd_key[b]);
+      va_mcd_key[b] = NULL;
+    }
+  }
+  return 0;
+}
+
+/* The one file a descriptor names, for the operations that only make sense on
+ * one: NULL for a reserved descriptor, a closed one, or an mcd naming several. */
+static void *va_one_file(int32_t desc) {
+  uint32_t d = (uint32_t)desc;
+  if (d & VA_FD_BIT) {
+    uint32_t i = d & ~VA_FD_BIT;
+    if (i < VA_FD_RESERVED || i >= VA_NFD) {
+      return NULL;
+    }
+    return va_fd[i];
+  }
+  for (uint32_t b = 1; b < VA_NMCD; b++) {
+    if ((d >> b) & 1) {
+      /* Only if it is the only bit set. */
+      if ((d & ~(1u << b) & ~1u) != 0) {
+        return NULL;
+      }
+      return va_mcd[b];
+    }
+  }
+  return NULL;
+}
+
+void va_fputs(void *handle, int32_t desc, char *msg, uint32_t lvl) {
+  uint32_t d = (uint32_t)desc;
+  if (d & VA_FD_BIT) {
+    uint32_t i = d & ~VA_FD_BIT;
+    if (i < VA_FD_RESERVED) {
+      osdi_log(handle, msg, lvl);
+    } else if (i < VA_NFD && va_fd[i] != NULL) {
+      fputs(msg, va_fd[i]);
+    }
+    return;
+  }
+  /* Channel 0 is the simulator's own output. */
+  if (d & 1) {
+    osdi_log(handle, msg, lvl);
+  }
+  for (uint32_t b = 1; b < VA_NMCD; b++) {
+    if (((d >> b) & 1) && va_mcd[b] != NULL) {
+      fputs(msg, va_mcd[b]);
+    }
+  }
+}
+
+/* 9.5.6: "$fflush(mcd) ... writes any buffered output"; with no argument it
+ * flushes everything this library has open. */
+int32_t va_fflush(int32_t desc, int32_t all) {
+  if (all) {
+    for (uint32_t i = VA_FD_RESERVED; i < VA_NFD; i++) {
+      if (va_fd[i] != NULL) {
+        fflush(va_fd[i]);
+      }
+    }
+    for (uint32_t b = 1; b < VA_NMCD; b++) {
+      if (va_mcd[b] != NULL) {
+        fflush(va_mcd[b]);
+      }
+    }
+    return 0;
+  }
+  {
+    uint32_t d = (uint32_t)desc;
+    if (d & VA_FD_BIT) {
+      void *f = va_one_file(desc);
+      if (f != NULL) {
+        fflush(f);
+      }
+      return 0;
+    }
+    for (uint32_t b = 1; b < VA_NMCD; b++) {
+      if (((d >> b) & 1) && va_mcd[b] != NULL) {
+        fflush(va_mcd[b]);
+      }
+    }
+  }
+  return 0;
+}
+
+int32_t va_feof(int32_t desc) {
+  void *f = va_one_file(desc);
+  /* A descriptor that names no file is at its end as much as it is anywhere. */
+  return f == NULL ? 1 : (feof(f) != 0 ? 1 : 0);
+}
+
+int32_t va_ftell(int32_t desc) {
+  void *f = va_one_file(desc);
+  return f == NULL ? -1 : (int32_t)ftell(f);
+}
+
+int32_t va_fseek(int32_t desc, int32_t offset, int32_t operation) {
+  void *f = va_one_file(desc);
+  return f == NULL ? -1 : (int32_t)fseek(f, (long)offset, (int)operation);
+}
+
+int32_t va_rewind(int32_t desc) {
+  void *f = va_one_file(desc);
+  if (f == NULL) {
+    return -1;
+  }
+  return (int32_t)fseek(f, 0, 0 /* SEEK_SET */);
+}
+
+/* True the first time it is called at a given value and false while the value
+ * stays the same.
+ *
+ * The cell is the uncommitted half of a retained slot, which is written as soon
+ * as it is assigned rather than when a timestep is accepted -- so passing
+ * `$abstime` distinguishes the first evaluation at a timepoint from the Newton
+ * iterations that follow it, which is what "at the end of the current simulation
+ * time" needs in order not to mean "once per iteration". It is per instance,
+ * because the slot is.
+ */
+double retained_first(double *dst, double val) {
+  if (*dst == val) {
+    return 0.0;
+  }
+  *dst = val;
+  return 1.0;
+}
 
 #define FMT_OFF 6
 #define NUM_FMT 11

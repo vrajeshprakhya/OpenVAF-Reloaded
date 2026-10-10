@@ -756,6 +756,13 @@ impl Ctx<'_> {
             | BuiltIn::warning
             | BuiltIn::error
             | BuiltIn::info
+            // VAMS-2023 9.5.2: the file forms format exactly as 9.4's do. The
+            // leading descriptor is an integer rather than a format string, so the
+            // walk below steps over it on its own.
+            | BuiltIn::fdisplay
+            | BuiltIn::fwrite
+            | BuiltIn::fstrobe
+            | BuiltIn::fdebug
             | BuiltIn::fatal => self.infere_display(stmt, args),
 
             _ => (),

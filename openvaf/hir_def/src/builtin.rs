@@ -188,24 +188,13 @@ impl BuiltIn {
             | BuiltIn::analog_port_alias
             | BuiltIn::test_plusargs
             | BuiltIn::value_plusargs
-            | BuiltIn::fclose
-            | BuiltIn::fopen
-            | BuiltIn::fdisplay
-            | BuiltIn::fwrite
-            | BuiltIn::fstrobe
             | BuiltIn::fmonitor
             | BuiltIn::fgets
             | BuiltIn::fscanf
             | BuiltIn::swrite
             | BuiltIn::sformat
             | BuiltIn::sscanf
-            | BuiltIn::rewind
-            | BuiltIn::fseek
-            | BuiltIn::ftell
-            | BuiltIn::fflush
-            | BuiltIn::ferror
-            | BuiltIn::feof
-            | BuiltIn::fdebug => true,
+            | BuiltIn::ferror => true,
             _ => false,
         }
     }
