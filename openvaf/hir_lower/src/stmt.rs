@@ -384,6 +384,48 @@ impl BodyLoweringCtx<'_, '_, '_> {
         let bound = self.ctx.make_select(usable, |_s, taken| if taken { aim } else { never });
         self.bound_step(bound);
     }
+    /// The condition an `initial_step` or `final_step` element of an event
+    /// expression contributes (VAMS-2023 5.10.2), or `None` when it has none to
+    /// contribute and so leaves the body unconditional.
+    ///
+    /// `initial_step` is "active during the solution of the first point", which is
+    /// what the retained first-evaluation flag answers. `final_step` is active at
+    /// the last point, and nothing in OSDI says which point that is, so it
+    /// contributes only its analysis list; `hir_ty` warns (`unscheduled_event`)
+    /// that the body is therefore reached at every evaluation.
+    ///
+    /// An analysis list narrows either one to the analyses it names -- 5.10.2's
+    /// `@(initial_step("static", "ic"))` is the first point of those two analyses
+    /// and of no others -- which is one `analysis()` test per name, ORed. Left out,
+    /// the list was silently the same as no list at all: an initializer meant for a
+    /// dc operating point ran in a transient run too, and a `final_step("tran")`
+    /// writing a summary file wrote one during every analysis.
+    fn global_event(&mut self, kind: hir::GlobalEvent, phases: &[String]) -> Option<Value> {
+        let during = match kind {
+            // Without retained state (the init function, verilogae) there is no flag
+            // to key on, and the body stays unconditional as before.
+            hir::GlobalEvent::InitialStep if !self.ctx.no_equations => Some(self.ctx.first_eval()),
+            _ => None,
+        };
+
+        let mut listed: Option<Value> = None;
+        for phase in phases {
+            let name = self.ctx.sconst(phase);
+            let is = self.ctx.call1(CallBackKind::Analysis, &[name]);
+            let is = self.ctx.insert_cast(is, &Type::Integer, &Type::Bool);
+            listed = Some(match listed {
+                Some(prev) => self.or(prev, is),
+                None => is,
+            });
+        }
+
+        match (during, listed) {
+            (Some(during), Some(listed)) => Some(self.and(during, listed)),
+            (Some(cond), None) | (None, Some(cond)) => Some(cond),
+            (None, None) => None,
+        }
+    }
+
     pub(super) fn lower_stmt(&mut self, stmnt: StmtId) {
         // TODO(msrv): let .. else
         let stmnt = if let Some(stmnt) = self.body.get_stmt(stmnt) {
@@ -399,50 +441,18 @@ impl BodyLoweringCtx<'_, '_, '_> {
                 // VAMS-2023 5.10.1: the body runs when *any* of the ORed events
                 // occurs.
                 //
-                // Track `@(initial_step)` so resets of retained (`@cross`) variables
-                // inside it are treated as initial values (read from the retained
-                // state) rather than per-evaluation resets. That only holds when the
-                // initial step is the whole event expression: ORed with anything
-                // else the body runs at other times too, so an assignment in it is
-                // not just an initial value.
-                let initial_step = !events.is_empty()
-                    && events.iter().all(|event| {
-                        matches!(
-                            event,
-                            hir::Event::Global { kind: hir::GlobalEvent::InitialStep, .. }
-                        )
-                    });
-
-                if initial_step {
-                    // Guard the body on a retained "first evaluation" flag so an
-                    // initializer applies once and then lets retention carry it,
-                    // instead of being re-applied on every evaluation. Without
-                    // retained state (the init function, verilogae) there is no flag
-                    // to key on, and the body stays unconditional as before.
-                    if self.ctx.no_equations {
-                        self.lower_stmt(body);
-                    } else {
-                        let first = self.ctx.first_eval();
-                        self.ctx.make_cond(first, |ctx, branch| {
-                            if branch {
-                                BodyLoweringCtx { body: self.body, path: self.path, ctx }
-                                    .lower_stmt(body)
-                            }
-                        });
-                    }
-                    return;
-                }
-
                 // Every element that carries a runtime condition contributes one:
-                // a named event its flag (VAMS-2023 5.10.4), a monitored event its
-                // crossing detection (5.10.3). The body is guarded by the
-                // disjunction only if *every* element has one -- an element that is
-                // still unscheduled, or an unresolved event, leaves the body
+                // `initial_step` its first-evaluation flag (5.10.2), a named event
+                // its flag (5.10.4), a monitored event its crossing detection
+                // (5.10.3). The body is guarded by the disjunction only if *every*
+                // element has one -- an element that is still unscheduled, an
+                // unresolved event, or a bare `final_step`, leaves the body
                 // unconditional, which is how all of them behaved before.
                 let mut conds = Vec::with_capacity(events.len());
                 let mut all = !events.is_empty();
                 for event in events {
                     let cond = match *event {
+                        hir::Event::Global { kind, ref phases } => self.global_event(kind, phases),
                         hir::Event::Named { event } => self
                             .body
                             .resolve_event(event)

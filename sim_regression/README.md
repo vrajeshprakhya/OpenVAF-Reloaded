@@ -28,6 +28,7 @@ last_crossing  PASS
 timer          PASS
 transition     PASS
 vecsrc         PASS
+global_events  PASS
 absdelay       PASS
 filelog        PASS
 pll            PASS
@@ -324,6 +325,56 @@ There is no way for a model to ask "is this the first evaluation of this
 timepoint" -- `$strobe` has that built in, and nothing else can get at it. Which
 is, once again, the accept callback at the top of
 `docs/lrm-system-level-gaps.md`.
+
+## global_events — passing
+
+VAMS-2023 5.10.2's two global events, and the analysis list that narrows them.
+Three claims in one run, and one netlist that can tell them apart: the sampling
+clock crosses its threshold at 2 us and 8 us, while the input crosses *its* at
+5 us, so a sampler that is tracking rather than sampling puts its edge somewhere
+no clock edge is.
+
+```
+v(in) at 2 us / 8 us  : 1.000 V / 4.000 V  (threshold 2.5 V)
+v(out) before 8 us    : 0.00e+00 V from 0  (tol 1e-03)
+v(out) after 8 us     : 0.00e+00 V from 1  (tol 1e-03)
+bit moved at          : 8.010 us  (clock edge 8.000 us, input crossing 5.000 us)
+
+v(ptran) initial_step("tran"): 1.000 .. 1.000  (want 1)
+v(pac)   ...("ac")           : 0.000 .. 0.000  (want 0)
+v(pstatic) ...("static")     : 0.000 .. 0.000  (reported, not asserted)
+```
+
+The sampler is 5.10.1's own example, `@(initial_step or cross(V(smpl) - 2.5, +1))`
+over a one-bit decision. It is the case where a global event has to contribute a
+condition to an event expression rather than merely be accepted in one: an
+element with no condition leaves the whole body unconditional, so an
+`initial_step` that contributed none cancelled the `cross` beside it and the
+sampler tracked its input for the whole run. The previous compiler puts the edge
+at 5.015 us here and warns that `cross` "does not schedule an event yet", which
+is true as far as it goes but blames the wrong half of the expression.
+
+The two flags are the analysis list. `v(pac)` is set from `@(initial_step("ac"))`
+and from `@(final_step("ac"))`, neither of which belongs in a transient run, and
+the previous compiler sets it: the list parsed, type-checked and then meant
+nothing. The in-tree test is the better half of this one, because the mock
+simulator supplies the analysis flags itself and can therefore run the same model
+as an ac analysis and require the other answer.
+
+What the list cannot fix is which *point* of a transient analysis `final_step`
+is. Nothing in OSDI says, so the body runs at every evaluation of the analyses
+its list names, and the compiler warns (`L018`) rather than letting a model
+believe otherwise.
+
+The third flag is reported and not asserted, because what it reads says something
+about the simulator rather than about the compiler, and it is worth knowing before
+writing an analysis list. `@(initial_step("static"))` counts **zero**: ngspice
+sets ANALYSIS_STATIC on the first Newton iteration of the initial step and
+ANALYSIS_TRAN on the rest, so the body runs on one iteration and the iterations
+after it write the retained value back over what it did. This is the same
+instability that cost `above` its first implementation, two sections up. The names
+that name an *analysis* -- "tran", "ac", "dc", "noise" -- are held steady for a
+whole run, and they are the ones to put in a list.
 
 ## filelog — passing
 

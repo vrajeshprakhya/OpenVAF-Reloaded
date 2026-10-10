@@ -136,6 +136,13 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                 let src = self.body_sm.lint_src(stmt, unscheduled_event);
                 Some((unscheduled_event, src))
             }
+            // The same lint as an event function that does not schedule: the shape of
+            // the problem is the same one, a body that runs when the event it names
+            // has not occurred.
+            BodyValidationDiagnostic::UnconditionalFinalStep { stmt } => {
+                let src = self.body_sm.lint_src(stmt, unscheduled_event);
+                Some((unscheduled_event, src))
+            }
             BodyValidationDiagnostic::IgnoredDiscontinuity { stmt, .. } => {
                 let src = self.body_sm.lint_src(stmt, ignored_discontinuity);
                 Some((ignored_discontinuity, src))
@@ -274,6 +281,32 @@ impl Diagnostic for BodyValidationDiagnosticWrapped<'_> {
                         "the event expression is checked but takes no part in scheduling"
                             .to_owned(),
                         "the guarded statement runs on every evaluation, not per event".to_owned(),
+                    ])
+            }
+            BodyValidationDiagnostic::UnconditionalFinalStep { stmt } => {
+                let FileSpan { range, file } = self.parse.to_file_span(
+                    self.body_sm.stmt_map_back[stmt].as_ref().unwrap().range(),
+                    self.sm,
+                );
+
+                Report::warning()
+                    .with_message("'final_step' does not select the last point".to_owned())
+                    .with_labels(vec![Label {
+                        style: LabelStyle::Primary,
+                        file_id: file,
+                        range: range.into(),
+                        message: "body is evaluated unconditionally".to_owned(),
+                    }])
+                    .with_notes(vec![
+                        "nothing in OSDI tells a model which point is the last one, so the event \
+                         cannot be scheduled"
+                            .to_owned(),
+                        "an analysis list is honoured, so the body is confined to the analyses it \
+                         names, but runs at every evaluation of them"
+                            .to_owned(),
+                        "help: a file does not need closing for what was written to it to arrive, \
+                         and '$fclose' here closes it on the first evaluation"
+                            .to_owned(),
                     ])
             }
             BodyValidationDiagnostic::IgnoredDiscontinuity { expr, .. } => {

@@ -139,6 +139,7 @@ run last_crossing last_crossing lc_out.txt analyze_last_crossing.py
 run timer         timer         tm_out.txt analyze_timer.py
 run transition    trfilter      tr_out.txt analyze_transition.py
 run vecsrc        vecsrc        vs_out.txt analyze_vecsrc.py
+run global_events global_events ge_out.txt analyze_global_events.py
 run_absdelay
 run_filelog
 run_pll

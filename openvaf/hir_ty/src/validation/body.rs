@@ -3,8 +3,9 @@ use std::mem::replace;
 use ahash::{HashMap, HashSet};
 use hir_def::body::Body;
 use hir_def::{
-    expr::Event, BranchId, BuiltIn, DefWithBodyId, DisciplineId, Expr, ExprId, FunctionArgLoc,
-    Literal, Lookup, ModuleBodyKind, NatureId, NodeId, ParamId, Path, Stmt, StmtId, VarId,
+    expr::Event, expr::GlobalEvent, BranchId, BuiltIn, DefWithBodyId, DisciplineId, Expr, ExprId,
+    FunctionArgLoc, Literal, Lookup, ModuleBodyKind, NatureId, NodeId, ParamId, Path, Stmt, StmtId,
+    VarId,
 };
 use stdx::impl_display;
 use syntax::ast::{AssignOp, UnaryOp};
@@ -72,6 +73,14 @@ pub enum BodyValidationDiagnostic {
     UnscheduledEvent {
         stmt: StmtId,
         func: BuiltIn,
+    },
+
+    /// VAMS-2023 5.10.2: `@(final_step)` is "active during the solution of the last
+    /// point", and nothing in OSDI tells a model which point that is, so the body is
+    /// reached at every evaluation instead. An analysis list is honoured, so the
+    /// body is at least confined to the analyses it names.
+    UnconditionalFinalStep {
+        stmt: StmtId,
     },
 
     /// VAMS-2023 9.17.1: `$discontinuity(n)` for a non-negative degree is accepted
@@ -324,11 +333,13 @@ impl BodyValidator<'_> {
                     .collect();
                 // Mirror `hir_lower`'s `EventControl`: the body is guarded only if
                 // *every* element of the event expression carries a runtime
-                // condition -- a named event its flag, `cross` its crossing. One
-                // element without one (a global event, `timer`, ...) leaves the whole
-                // body unconditional, however well the others schedule.
+                // condition -- `initial_step` its first-evaluation flag, a named
+                // event its flag, `cross` its crossing. One element without one
+                // (`final_step`, `timer`, ...) leaves the whole body unconditional,
+                // however well the others schedule.
                 let all_scheduled = !events.is_empty()
                     && events.iter().all(|event| match *event {
+                        Event::Global { kind, .. } => kind == GlobalEvent::InitialStep,
                         Event::Named { event } => {
                             matches!(self.infer.expr_types[event], Ty::Event(_))
                         }
@@ -338,6 +349,19 @@ impl BodyValidator<'_> {
                         ),
                         _ => false,
                     });
+
+                // 5.10.2 puts `final_step` at the last point, and an analysis list
+                // narrows which analyses it applies to but says nothing about which
+                // point is the last one -- which no part of OSDI does either. So the
+                // body is reached at every evaluation, and that is worth saying: it
+                // is where a model puts the summary it writes once, and `$fclose` in
+                // it closes the file on the first evaluation instead of the last.
+                for event in events {
+                    if matches!(*event, Event::Global { kind: GlobalEvent::FinalStep, .. }) {
+                        self.diagnostics
+                            .push(BodyValidationDiagnostic::UnconditionalFinalStep { stmt });
+                    }
+                }
 
                 let old = replace(&mut self.ctx, BodyCtx::EventControl);
                 let old_event = replace(&mut self.in_event_control, true);

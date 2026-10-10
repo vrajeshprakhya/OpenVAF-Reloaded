@@ -1205,6 +1205,101 @@ fn test_file_scan() -> Result<()> {
     Ok(())
 }
 
+/// VAMS-2023 5.10.2: a global event contributes a condition like any other element
+/// of an event expression, and its analysis list says which analyses it belongs to.
+///
+/// This is the one harness that can check an analysis list, because it supplies the
+/// flags itself: the same model is evaluated once as a transient analysis and once
+/// as an ac one, and each list has to pick out its own. See `global_events.va`.
+fn test_global_events() -> Result<()> {
+    if stdx::IS_CI && cfg!(windows) {
+        return Ok(());
+    }
+
+    let desc = test_descriptor(&openvaf_test_data("osdi").join("global_events.va"))?;
+    let model = desc.new_model();
+    model.process_params()?;
+
+    let step = |instance: &OsdiInstance,
+                model: &OsdiModel,
+                sim: &mut MockSimulation,
+                v_in: f64,
+                v_smpl: f64,
+                flags: EvalFlags,
+                first: bool| {
+        if !first {
+            sim.next_iter();
+            sim.advance_time(1e-6);
+        }
+        sim.set_voltage("in", v_in);
+        sim.set_voltage("smpl", v_smpl);
+        for node in ["samp", "ntran", "nac", "nfinal"] {
+            sim.set_voltage(node, 0.0);
+        }
+        instance.eval(model, sim, flags);
+        instance.load_dae(model, sim);
+        (
+            sim.read_residual("flow(samp)").0,
+            sim.read_residual("flow(ntran)").0,
+            sim.read_residual("flow(nac)").0,
+            sim.read_residual("flow(nfinal)").0,
+        )
+    };
+
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    // The first point of a transient analysis. `initial_step` fires whatever the
+    // list says, `initial_step("tran")` because the list names this analysis, and
+    // `initial_step("ac")` not at all.
+    let (samp, ntran, nac, nfinal) =
+        step(&instance, &model, &mut sim, 3.0, 0.0, EvalFlags::ANALYSIS_TRAN, true);
+    float_cmp::assert_approx_eq!(f64, samp, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, ntran, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nac, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nfinal, 1.0, epsilon = 1e-9);
+
+    // Time has moved, so the first point is behind us: the initial-step counter
+    // stops, and the sampled bit holds although the input has dropped below the
+    // threshold, because the clock has not crossed.
+    let (samp, ntran, _, nfinal) =
+        step(&instance, &model, &mut sim, 1.0, 0.0, EvalFlags::ANALYSIS_TRAN, false);
+    float_cmp::assert_approx_eq!(f64, samp, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, ntran, 1.0, epsilon = 1e-9);
+    // `final_step` counts every evaluation, which is what it cannot help doing and
+    // what the warning on it says.
+    float_cmp::assert_approx_eq!(f64, nfinal, 2.0, epsilon = 1e-9);
+
+    // The clock crosses upwards: the bit is taken again, now from an input below
+    // the threshold. That is the half of the event expression the `initial_step`
+    // beside it used to cancel by leaving the body unconditional.
+    let (samp, _, _, _) =
+        step(&instance, &model, &mut sim, 1.0, 5.0, EvalFlags::ANALYSIS_TRAN, false);
+    float_cmp::assert_approx_eq!(f64, samp, 0.0, epsilon = 1e-9);
+
+    // Clock still high, so there is nothing to cross: the input rising back above
+    // the threshold does not reach the bit.
+    let (samp, _, _, _) =
+        step(&instance, &model, &mut sim, 3.0, 5.0, EvalFlags::ANALYSIS_TRAN, false);
+    float_cmp::assert_approx_eq!(f64, samp, 0.0, epsilon = 1e-9);
+
+    // The same model, the same first point, a different analysis. A fresh instance,
+    // because what makes a point the first one is retained per instance.
+    let mut instance = model.new_instance();
+    let mut sim = instance.mock_simulation(&model, desc.num_terminals, 300.0)?;
+
+    let (samp, ntran, nac, nfinal) =
+        step(&instance, &model, &mut sim, 3.0, 0.0, EvalFlags::ANALYSIS_AC, true);
+    float_cmp::assert_approx_eq!(f64, samp, 1.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, ntran, 0.0, epsilon = 1e-9);
+    float_cmp::assert_approx_eq!(f64, nac, 1.0, epsilon = 1e-9);
+    // And `final_step("tran")`, which runs at every evaluation of a transient
+    // analysis, runs at none of an ac one.
+    float_cmp::assert_approx_eq!(f64, nfinal, 0.0, epsilon = 1e-9);
+
+    Ok(())
+}
+
 /// VAMS-2023: analog block variables keep their value between evaluations, so a
 /// read can precede the statement that assigns it and pick up the previous
 /// evaluation's value. See `var_persistence.va` for the three shapes checked here.
@@ -1918,5 +2013,5 @@ harness! {
     Test::from_dir_filtered("vacask_spice", &vacask_spice_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice")),
     // VACASK simplified SPICE models
     Test::from_dir_filtered("vacask_spice_sn", &vacask_spice_sn_test, &is_va_file, &ignore_dev_tests, &vacask_devices().join("spice/sn")),
-    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan)]
+    [Test::new("$limit", &test_limit),Test::new("noise", &test_noise),Test::new("arrays", &test_arrays),Test::new("cross_latch", &test_cross_latch),Test::new("laplace_nd_int", &test_laplace_nd_int),Test::new("vector_ports", &test_vector_ports),Test::new("qam16", &test_qam16),Test::new("cross_array", &test_cross_array),Test::new("adc", &test_adc),Test::new("indirect_opamp", &test_indirect_opamp),Test::new("laplace_null_zeros", &test_laplace_null_zeros),Test::new("laplace_roots", &test_laplace_roots),Test::new("slew", &test_slew),Test::new("cross_detect", &test_cross_detect),Test::new("above_detect", &test_above_detect),Test::new("last_crossing", &test_last_crossing),Test::new("var_persistence", &test_var_persistence),Test::new("timer_detect", &test_timer_detect),Test::new("rng_stream", &test_rng_stream),Test::new("transition_pwl", &test_transition_pwl),Test::new("table_model", &test_table_model),Test::new("zi_filter", &test_zi_filter),Test::new("absdelay", &test_absdelay),Test::new("absdelay_in_model", &test_absdelay_in_model),Test::new("timer_resched", &test_timer_resched),Test::new("case_default", &test_case_default),Test::new("file_io", &test_file_io),Test::new("file_scan", &test_file_scan),Test::new("global_events", &test_global_events)]
 }
