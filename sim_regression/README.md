@@ -27,6 +27,7 @@ above_init     PASS
 last_crossing  PASS
 timer          PASS
 transition     PASS
+vecsrc         PASS
 absdelay       PASS
 filelog        PASS
 pll            PASS
@@ -283,6 +284,46 @@ caps the step at the spacing of its own history grid. In AC at 100 kHz with
 `td = 1 us` the protocol gives exactly −0.628 rad and the in-model realization
 gives none at all; it has no phase to offer, which is the other half of why the
 protocol is the default.
+
+## vecsrc — passing
+
+The other direction from `filelog`: here the file is the *input*, and it is also
+the reference. `vectors.txt` holds four records of "when, what, and a name for
+it"; the model reads them with `$fgets` and `$sscanf` and steps through them with
+`timer`, and the analyzer reads the same file and requires the waveform to be
+what it says.
+
+```
+records in the file: 4, loaded by the model: 4
+before the first record: +0.000000 V
+   1.000 us  rise  want +0.500000 V  got +0.500000 V
+   2.000 us  hold  want +1.500000 V  got +1.500000 V
+   3.000 us  fall  want -0.250000 V  got -0.250000 V
+   4.000 us  last  want +2.000000 V  got +2.000000 V
+worst value error: 0.000e+00 V
+```
+
+### Why the file is read all at once
+
+Not for speed. **A read advances the file whether or not the timepoint has
+changed**, and an analog block is evaluated several times for one timepoint, so a
+`$fgets` in an event handler consumes a record per Newton iteration rather than
+per event. The first version of this model read a record per event and swallowed
+three of the four before the simulation had left t = 0.
+
+So the records are loaded into arrays once and stepped through from there. That
+runs into the same thing from the other side -- 5.10.2 puts `@(initial_step)` in
+force "during the solution of the first point", which is all of its iterations --
+and the answer is `$rewind` at the top of the block: every run of it then reads
+the same records into the same places, so running several times costs nothing and
+changes nothing. Writing has the same shape and the same answer: `filelog` opens
+its files in `@(initial_step)` and `$fopen` hands back the descriptor it already
+opened rather than truncating the file again.
+
+There is no way for a model to ask "is this the first evaluation of this
+timepoint" -- `$strobe` has that built in, and nothing else can get at it. Which
+is, once again, the accept callback at the top of
+`docs/lrm-system-level-gaps.md`.
 
 ## filelog — passing
 

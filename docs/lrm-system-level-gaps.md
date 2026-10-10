@@ -310,14 +310,13 @@ tighter than before, and the previous compiler fails it at 7.50e-05 V.
 All of these produce `function 'x' is currently not supported by OpenVAF`, from
 the `UNSUPPORTED` list at `sourcegen/src/hir_builtins.rs:29`.
 
-Three entries have left this tier since it was written: the Z-transform filters
-(4.5.12), `$table_model` (9.21), and the output side of 9.5. What is left is
-9.5's input side and four odds and ends.
+Four entries have left this tier since it was written: the Z-transform filters
+(4.5.12), `$table_model` (9.21), and both sides of 9.5. What is left of it is two
+tasks, and there are four odds and ends besides.
 
 | Feature | Clause | What it blocks |
 | --- | --- | --- |
-| `$fscanf`, `$sscanf` | 9.5.4 | Parsing a line that has been read. Each writes back through a *variable number* of its arguments, which nothing else in the language does; the machinery for writing back through one (`$random`'s seed) exists. |
-| `$fgets`, `$swrite`, `$sformat`, `$ferror` | 9.5.3, 9.5.4, 9.5.7 | Each writes back through one argument, which would work — except that it is a *string* variable, and a string variable that needs retention crashes the compiler today (`unknown cast found Real -> String`, from the retained slot being a double). That is the thing to fix first. |
+| `$ferror` | 9.5.7 | Reporting *which* error. The codes are implementation-defined and this runtime has nothing to tell them apart with; `$feof` covers the case a model can act on. |
 | `$fmonitor` | 9.5.2 | Writing when an argument changes, which needs the change detected per argument. |
 | `$simprobe` | 9.16 | Probing another instance's signals. |
 | `$analog_node_alias`, `$analog_port_alias` | 9.20 | Node aliasing. |
@@ -413,6 +412,7 @@ write a PLL in this". So, by part, with the state of each measured in
 | Phase noise | `noise_table` / `flicker_noise` / `white_noise` (4.6) | works; the table has to be an array literal or a file, not a parameter array |
 | Delay line, DLL | `absdelay` (4.5.7) | works, both realizations — see Tier 0 |
 | Jitter or period logging | `$fstrobe` / `$fdisplay` to a file (9.5) | works; `sim_regression/filelog` checks a jitter sequence the model wrote itself |
+| Stimulus from a file of vectors | `$fgets` and `$sscanf` (9.5.4) | works; `sim_regression/vecsrc` drives a source from a file and checks the waveform against it |
 | Sigma-delta state for fractional-N | multi-dimensional arrays | **missing** for 2-D — Tier 4; a MASH needs only scalar accumulators, so this is a convenience |
 | A bare `transition(x)` with a file-wide edge rate | `` `default_transition `` (10.3) | **missing** — Tier 4 |
 
@@ -424,16 +424,16 @@ step as jitter. The event-driven one places its own edges and therefore has none
 of that, at the cost of sampling the control voltage once per edge rather than
 continuously — which is what a real oscillator does anyway.
 
-What is left for a PLL is therefore neither an operator nor a way out: a measured
-period or jitter sequence now leaves the model through 9.5's file tasks. What is
-left is the way *in* — a file of vectors needs `$fscanf`, and `$table_model` only
-covers the case where the file is data to interpolate rather than stimulus to
-step through.
+So nothing on this page now blocks writing a PLL, measuring one, or driving one
+from a file. What is left in the table above is a convenience
+(`` `default_transition ``), a shape of array nothing here needs, and the two 9.5
+tasks a testbench does not reach for.
 
 ## 9.5 — files
 
 Implemented: `$fopen`, `$fclose`, `$fdisplay`, `$fwrite`, `$fstrobe`, `$fdebug`,
-`$fflush`, `$ftell`, `$fseek`, `$rewind`, `$feof`. The front end already knew all
+`$fflush`, `$ftell`, `$fseek`, `$rewind`, `$feof`, `$fgets`, `$swrite`,
+`$sformat`, `$sscanf`, `$fscanf`. The front end already knew all
 of them — signatures, format-string checking and diagnostics were in place — so
 what was missing was the lowering, a runtime in `openvaf/osdi/stdlib.c`, and three
 decisions the clause does not make for you.
@@ -478,6 +478,56 @@ this is the reading that lets the idiom work. The cost is that a model wanting t
 independent handles on one file gets one, which 9.5 offers no way to ask for
 anyway.
 
+### Writing back through an argument
+
+9.5.3 and 9.5.4 put their result in an argument, which is the only way Verilog-A
+has of expressing it -- there are no pointers, so there is nothing for a runtime
+to write through. `$fgets` returns its line and `$sscanf` leaves its conversions
+in the runtime for the lowering to read back one at a time; the lowering does the
+assigning. The same shape as 9.13's seed, which has worked this way since
+`$random`.
+
+Which conversion produces what is settled at compile time from the format, so the
+format of a scan has to be a literal -- the type checker requires one. A target
+that is a variable, or one element of an array named by a constant index, is
+assigned; anything else is accepted by the type checker and then not assigned,
+which is a hole worth closing.
+
+`$fscanf` scans a line rather than the file, so a conversion cannot span a line
+break. For a file with one record per line, which is what a vector file is, that
+is the same thing.
+
+### Reading advances the file, and evaluation repeats
+
+The trap that cost the most here, and it belongs to the language rather than to
+9.5: **an analog block is evaluated several times for one timepoint, and a read
+advances the file every time.** A `$fgets` in an event handler consumes a record
+per Newton iteration rather than per event -- measured, three of four records
+swallowed before the simulation had left t = 0.
+
+A model cannot ask whether this is the first evaluation of a timepoint. `$strobe`
+can, because the guard is built into it; nothing else can reach it. So the way to
+read a file is to make the reading idempotent: `$rewind` and then read, so that
+repeating it reads the same thing. `sim_regression/vecsrc` loads its records that
+way and steps through them with `timer`.
+
+That is also what `$fopen` does for writing, by handing back a descriptor it has
+already opened rather than opening the file again, and it is one more argument for
+the accept callback at the top of this page.
+
+### A retained string
+
+A string variable that needed retention crashed the compiler
+(`unknown cast found Real -> String`): a retained slot is eight bytes meant for a
+double, and a string is not a number. 4.5.10 makes no exception for strings, so
+neither does retention now -- what goes in the slot is the pointer, which is what
+a string value is here, and `commit_retained` copies those eight bytes rather
+than assigning them as a number.
+
+The slot starts as zero, which reads back as the empty string: the value a string
+variable has before anything assigns one. Nothing frees what the pointer points
+at, which is already true of every string this compiler builds at run time.
+
 ## Confirmed working
 
 Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
@@ -489,8 +539,8 @@ Recorded so it is not re-litigated. All probed: `ddt`, `idt`, `idtmod`,
 contributions (5.6.7), analog user-defined functions (4.7), 1-D arrays, strings
 and string parameters, `aliasparam`, `$param_given`, `$port_connected`,
 `$simparam`, `$temperature`, `$vt`, `$abstime`, `$finish` / `$stop` / `$error` /
-`$info`, bus ports with `genvar` loops, the display tasks (9.4), and the output
-side of the file tasks (9.5, see above).
+`$info`, bus ports with `genvar` loops, the display tasks (9.4), and the file
+tasks (9.5, see above).
 
 ## Suggested order
 
@@ -519,17 +569,19 @@ side of the file tasks (9.5, see above).
 11. ~~**File I/O, the output side**~~ — done. `$fopen` through `$feof`, with
     `$strobe` and `$fstrobe` writing once per timepoint instead of once per
     iteration.
-12. **A retained string variable** — crashes the compiler, and it is what stands
-    between here and `$fgets`, `$swrite`, `$sformat` and `$ferror`. Small, and a
-    crash.
-13. **`$fscanf` / `$sscanf`** — writing back through a variable number of
-    arguments. With 12, this is the way *in* for a file of vectors.
-14. **Warn on `@(final_step)`** — Tier 1, and now a trap rather than a curiosity.
-    `L018` already exists; it needs to cover the global events.
-15. **`` `default_transition `` / `` `default_discipline ``** — independent,
+12. ~~**A retained string variable**~~ — done. The slot holds the pointer.
+13. ~~**`$fscanf` / `$sscanf`**~~ — done, with `$fgets`, `$swrite` and
+    `$sformat`: the way *in* for a file of vectors.
+14. **Warn on `@(final_step)`** — Tier 1, and a trap rather than a curiosity now
+    that there are files to close. `L018` already exists; it needs to cover the
+    global events.
+15. **Reject a scan target that is not a place** — accepted and then not
+    assigned, which is the silent kind of wrong this page is about.
+16. **`` `default_transition `` / `` `default_discipline ``** — independent,
     small, and immediately visible to model writers.
-16. **Multi-dimensional arrays** — still a parse error on the second subscript.
-17. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
-    No longer quite last on merit: it is what `$fstrobe` needs to mean what 9.4.1
-    says, and what would retire the `$abstime` workaround and give
-    `$discontinuity` something to say.
+17. **Multi-dimensional arrays** — still a parse error on the second subscript.
+18. **OSDI proposal** — accept callback plus breakpoint/discontinuity request.
+    No longer last on merit: it is what `$fstrobe` needs in order to mean what
+    9.4.1 says, what would let a model read one record per timepoint, and what
+    would retire the `$abstime` workaround and give `$discontinuity` something to
+    say.
